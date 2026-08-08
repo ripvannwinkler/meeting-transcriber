@@ -8,6 +8,7 @@ publish/
 recordings/
 output/
 models/
+publish/
 
 # Python backend
 backend/.venv/
