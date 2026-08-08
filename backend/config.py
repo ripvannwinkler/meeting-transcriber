@@ -57,12 +57,6 @@ class Settings:
     api: ApiSettings = field(default_factory=ApiSettings)
     output_dir: Path = Path("output")
 
-    def resolve_paths(self, root: Path) -> None:
-        """Resolve relative paths against a project root."""
-        for p in (self.stt.cache_dir, self.output_dir):
-            if not p.is_absolute():
-                p.absolute()  # no-op placeholder for clarity
-
 
 def _deep_merge(dst: dict, src: dict) -> None:
     for key, value in src.items():
@@ -76,8 +70,12 @@ def load_settings(path: str | Path | None = None) -> Settings:
     """Load settings from a settings.json file, merging over defaults.
 
     Missing keys fall back to defaults. Fails with a clear message if a
-    required section is present but of the wrong type.
+    required section is present but of the wrong type. Relative path settings
+    (stt.cache_dir, output_dir) resolve against the repository root
+    (parent of the backend/ directory), matching the C# Paths helper.
     """
+    repo_root = Path(__file__).resolve().parent.parent
+
     cfg = json.loads(json.dumps(_DEFAULTS))  # deep copy of defaults
 
     if path is None:
@@ -108,17 +106,23 @@ def load_settings(path: str | Path | None = None) -> Settings:
     _deep_merge(cfg, user_cfg)
 
     stt = cfg["stt"]
-    if stt["variant"] not in VALID_VARIANTS:
+    if not stt["variant"] or stt["variant"] not in VALID_VARIANTS:
         raise ValueError(
             f"Unknown STT variant '{stt['variant']}'. "
             f"Allowed: {', '.join(sorted(VALID_VARIANTS))}"
         )
 
+    cache_dir = Path(str(stt["cache_dir"]))
+    output_dir = Path(str(cfg["output_dir"]))
+
+    def _abs(p: Path) -> Path:
+        return p if p.is_absolute() else repo_root / p
+
     settings = Settings(
         stt=SttSettings(
             engine=str(stt["engine"]),
             variant=str(stt["variant"]),
-            cache_dir=Path(str(stt["cache_dir"])),
+            cache_dir=_abs(cache_dir),
             auto_download=bool(stt["auto_download"]),
             device=str(stt["device"]),
         ),
@@ -128,6 +132,6 @@ def load_settings(path: str | Path | None = None) -> Settings:
             model=str(cfg["api"]["model"]),
             max_tokens=int(cfg["api"]["max_tokens"]),
         ),
-        output_dir=Path(str(cfg["output_dir"])),
+        output_dir=_abs(output_dir),
     )
     return settings

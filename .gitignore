@@ -6,6 +6,7 @@ obj/
 # Recordings and generated output
 recordings/
 output/
+models/
 
 # Python backend
 backend/.venv/
