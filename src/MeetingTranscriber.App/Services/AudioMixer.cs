@@ -122,16 +122,22 @@ public sealed class AudioMixer : IDisposable
     }
 
     /// <summary>
-    /// Pulls up to <paramref name="frameBuffer"/>'s capacity of interleaved samples of
-    /// mixed output. Returns the number of samples actually produced (0 when no source
-    /// currently has buffered data). Completion is not decided here; the caller drains
-    /// until it has stopped all sources and <see cref="IsDrained"/> is true.
+    /// Pulls up to <paramref name="frameBuffer"/>'s capacity (or <paramref name="maxSamples"/>
+    /// if given) of interleaved samples of mixed output. Returns the number of samples
+    /// actually produced (0 when no source currently has buffered data). Completion is not
+    /// decided here; the caller drains until it has stopped all sources and
+    /// <see cref="IsDrained"/> is true.
     /// </summary>
-    public int ReadMix(float[] frameBuffer)
+    public int ReadMix(float[] frameBuffer, int maxSamples = 0)
     {
         lock (_sync)
         {
             var target = frameBuffer.Length;
+            if (maxSamples > 0 && maxSamples < target)
+                target = maxSamples;
+            if (target <= 0)
+                return 0;
+
             Array.Clear(frameBuffer, 0, target);
 
             var scratch = new float[target];

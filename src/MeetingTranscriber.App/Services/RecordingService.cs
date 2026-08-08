@@ -1,3 +1,4 @@
+using System.Diagnostics;
 using System.IO;
 using NAudio.CoreAudioApi;
 using NAudio.Wave;
@@ -194,16 +195,11 @@ public sealed class RecordingService : IDisposable
         _mixThread = null;
 
         var path = _outputPath;
+        int bytesPerSecond =
+            OutputFormat.SampleRate * OutputFormat.Channels * (OutputFormat.BitsPerSample / 8);
         var duration = 0f;
         if (_writer != null)
         {
-            duration =
-                _writer.Length
-                / (float)(
-                    OutputFormat.SampleRate
-                    * OutputFormat.Channels
-                    * (OutputFormat.BitsPerSample / 8)
-                );
             _writer.Dispose();
             _writer = null;
         }
@@ -211,6 +207,10 @@ public sealed class RecordingService : IDisposable
         // Trim the trailing silence the resampler padded the recording with.
         if (_lastNonZeroSample >= 0)
             TrimWaveFile(path, (_lastNonZeroSample + 1) * 2);
+
+        // Report duration from the final trimmed file (not the pacer's padded length).
+        if (File.Exists(path))
+            duration = new FileInfo(path).Length / (float)bytesPerSecond;
 
         _loopback?.Dispose();
         _loopback = null;
@@ -247,7 +247,8 @@ public sealed class RecordingService : IDisposable
             WasapiCapture capture =
                 state.Kind == SourceKind.Loopback
                     ? new WasapiLoopbackCapture(device)
-                    : new WasapiCapture(device);
+                    // event-sync avoids the NAudio burst-read crash on some mic devices
+                    : new WasapiCapture(device, useEventSync: true);
             SetCapture(state.Kind, capture);
 
             var format = capture.WaveFormat;
@@ -450,13 +451,41 @@ public sealed class RecordingService : IDisposable
     {
         var shortBuf = new short[chunk.Length];
         var byteBuf = new byte[chunk.Length * 2];
-        int drainTicks = 0;
         long totalSamples = 0;
         _lastNonZeroSample = -1; // last non-zero sample index, for trailing-silence trim
 
+        // Pacing: the recorder must write audio at exactly real time. If input buffers
+        // deliver in bursts (WASAPI/WDL resampler jitter), reading greedily every loop
+        // can consume ~8x real time and time-stretch the WAV (which makes Whisper return
+        // an empty transcript). So we bound each read to the wall clock's progress.
+        long samplesPerSecond = OutputFormat.SampleRate * OutputFormat.Channels; // 96000
+        var clock = Stopwatch.StartNew();
+        long writtenSamples = 0;
+        long drainedSinceMs = -1;
+
         while (true)
         {
-            var count = _mixer!.ReadMix(chunk);
+            bool drained = _stopRequested && _mixer!.IsDrained;
+
+            int budget;
+            if (drained)
+                budget = chunk.Length; // short flush window after input drains
+            else
+                budget = (int)
+                    Math.Clamp(
+                        (long)(clock.Elapsed.TotalSeconds * samplesPerSecond) - writtenSamples,
+                        0,
+                        chunk.Length
+                    );
+
+            // If we're exactly at (or ahead of) real time, wait for the clock to catch up.
+            if (!drained && budget == 0)
+            {
+                Thread.Sleep(5);
+                continue;
+            }
+
+            var count = _mixer!.ReadMix(chunk, budget);
             if (count > 0)
             {
                 count -= count % 2; // keep frame-aligned for 16-bit stereo
@@ -477,6 +506,7 @@ public sealed class RecordingService : IDisposable
                     Buffer.BlockCopy(shortBuf, 0, byteBuf, 0, count * 2);
                     _writer!.Write(byteBuf, 0, count * 2);
                     totalSamples += count;
+                    writtenSamples += count;
                 }
             }
 
@@ -484,16 +514,19 @@ public sealed class RecordingService : IDisposable
             // ReadMix never returns 0. Once stopping is requested and every input buffer
             // is empty, keep pulling for a short bounded window to flush the resampler's
             // real signal tail, then finish and trim the trailing zeros that padded it.
-            if (_stopRequested && _mixer.IsDrained)
+            if (drained)
             {
-                if (++drainTicks >= 12) // ~1.2 s of pull window (trimmed from output)
+                if (drainedSinceMs < 0)
+                    drainedSinceMs = (long)clock.Elapsed.TotalMilliseconds;
+                if (clock.Elapsed.TotalMilliseconds - drainedSinceMs >= 300) // ~300 ms flush
                     break;
             }
             else
             {
-                drainTicks = 0;
+                drainedSinceMs = -1;
             }
-            Thread.Sleep(10);
+
+            Thread.Sleep(2);
         }
 
         if (_writer != null)
