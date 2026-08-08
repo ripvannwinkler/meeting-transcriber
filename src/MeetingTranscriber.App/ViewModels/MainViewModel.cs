@@ -11,7 +11,7 @@ namespace MeetingTranscriber.App.ViewModels;
 /// <see cref="RecordingService"/>, and the transcript/summary result area
 /// produced by <see cref="IConversationPipeline"/>.
 /// </summary>
-public sealed class MainViewModel : ObservableObject
+public sealed class MainViewModel : ObservableObject, IDisposable
 {
     private readonly RecordingService _recorder = new();
     private readonly IConversationPipeline _pipeline;
@@ -161,22 +161,41 @@ public sealed class MainViewModel : ObservableObject
     {
         if (IsRecording)
             return;
+
+        // Don't start if no loopback endpoint is selected (e.g. no devices on this machine).
+        if (SelectedPlayback is null)
+        {
+            Status = "No speaker output device available to record.";
+            return;
+        }
+
         Directory.CreateDirectory(Paths.RecordingsDir);
         _recordingPath = "";
         Transcript = "";
         Summary = "";
         _startedAt = DateTime.Now;
         TimerText = "00:00";
-        _timer.Start();
-        IsRecording = true;
-        Status = "Recording…";
 
-        _recorder.StartRecording(
-            SelectedPlayback!.Device,
-            SelectedInput?.Device,
-            MicGain,
-            Paths.RecordingsDir
-        );
+        try
+        {
+            _timer.Start();
+            IsRecording = true;
+            Status = "Recording…";
+            _recorder.StartRecording(
+                SelectedPlayback.Device,
+                SelectedInput?.Device,
+                MicGain,
+                Paths.RecordingsDir
+            );
+        }
+        catch (Exception ex)
+        {
+            // WASAPI init can fail (device unplugged / in use); surface it and unwind.
+            _timer.Stop();
+            TimerText = "";
+            IsRecording = false;
+            Status = "Could not start recording: " + ex.Message;
+        }
     }
 
     private void StopRecording()
@@ -263,5 +282,12 @@ public sealed class MainViewModel : ObservableObject
                     return option;
         }
         return options.FirstOrDefault();
+    }
+
+    public void Dispose()
+    {
+        // Stops any in-progress capture when the window closes.
+        _recorder.Dispose();
+        _timer.Stop();
     }
 }

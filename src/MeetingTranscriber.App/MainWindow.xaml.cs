@@ -6,9 +6,13 @@ namespace MeetingTranscriber.App;
 
 public partial class MainWindow : Window
 {
+    private readonly MainViewModel _viewModel;
+
     public MainWindow()
     {
         InitializeComponent();
-        DataContext = new MainViewModel(new PipelineClient());
+        _viewModel = new MainViewModel(new PipelineClient());
+        DataContext = _viewModel;
+        Closed += (_, _) => _viewModel.Dispose();
     }
 }

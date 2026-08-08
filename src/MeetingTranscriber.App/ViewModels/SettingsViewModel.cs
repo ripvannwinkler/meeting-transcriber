@@ -171,7 +171,22 @@ public sealed class SettingsViewModel : ObservableObject
 
     private void Save()
     {
-        _original.Api.BaseUrl = BaseUrl.Trim();
+        var baseUrl = BaseUrl.Trim();
+        if (
+            !baseUrl.StartsWith("http://", StringComparison.OrdinalIgnoreCase)
+            && !baseUrl.StartsWith("https://", StringComparison.OrdinalIgnoreCase)
+        )
+        {
+            Status = "Base URL must start with http:// or https://.";
+            return;
+        }
+        if (MaxTokens < 1)
+        {
+            Status = "Max tokens must be at least 1.";
+            return;
+        }
+
+        _original.Api.BaseUrl = baseUrl.TrimEnd('/');
         _original.Api.ApiKey = ApiKey.Trim();
         _original.Api.Model = Model.Trim();
         _original.Api.MaxTokens = MaxTokens;
