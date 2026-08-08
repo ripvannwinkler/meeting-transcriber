@@ -9,7 +9,9 @@ public sealed class NoopPipeline : IConversationPipeline
     public Task<string> TranscribeAsync(
         string wavPath,
         IProgress<string>? progress = null,
-        CancellationToken ct = default
+        CancellationToken ct = default,
+        string? loopbackTrack = null,
+        string? micTrack = null
     ) => Task.FromResult("(Transcription pipeline not wired up yet — coming in Phase 3.)");
 
     public Task<string> SummarizeAsync(

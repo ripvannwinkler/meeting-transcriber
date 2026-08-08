@@ -29,6 +29,8 @@ public sealed class MainViewModel : ObservableObject, IDisposable
     private string _summary = "";
     private bool _isProcessing;
     private string _recordingPath = "";
+    private string? _loopbackTrack;
+    private string? _micTrack;
     private InterruptedSession? _interruptedSession;
 
     public MainViewModel(IConversationPipeline pipeline)
@@ -248,6 +250,8 @@ public sealed class MainViewModel : ObservableObject, IDisposable
 
         Directory.CreateDirectory(Paths.RecordingsDir);
         _recordingPath = "";
+        _loopbackTrack = null;
+        _micTrack = null;
         Transcript = "";
         Summary = "";
         _startedAt = DateTime.Now;
@@ -288,13 +292,23 @@ public sealed class MainViewModel : ObservableObject, IDisposable
     {
         IsRecording = false;
         _recordingPath = r.Path;
+        _loopbackTrack = r.LoopbackTrack;
+        _micTrack = r.MicTrack;
         // A clean stop clears any interrupted-session state.
         _interruptedSession = null;
         ResumeRecordingCommand.RaiseCanExecuteChanged();
         TranscribeCommand.RaiseCanExecuteChanged();
-        Status = r.Interrupted
+
+        var baseline = r.Interrupted
             ? $"Saved: {r.Path} ({r.DurationSeconds:F1}s) — an audio stream dropped during recording, so there is a gap in the audio."
             : $"Saved: {r.Path} ({r.DurationSeconds:F1}s)";
+        Status =
+            $"{baseline}  [speaker signal {r.LoopbackSignalPct}% | mic signal {r.MicSignalPct}%]"
+            + (
+                r.LoopbackSignalPct < 25 || r.MicSignalPct < 25
+                    ? $"  Low signal! Details: {System.IO.Path.Combine(Paths.RecordingsDir, "recording_debug.log")}"
+                    : ""
+            );
     }
 
     /// <summary>
@@ -316,6 +330,8 @@ public sealed class MainViewModel : ObservableObject, IDisposable
             return;
 
         _recordingPath = dialog.FileName;
+        _loopbackTrack = null;
+        _micTrack = null;
         Transcript = "";
         Summary = "";
         TimerText = "";
@@ -347,7 +363,15 @@ public sealed class MainViewModel : ObservableObject, IDisposable
             Summary = "";
             Status = "Transcribing…";
             var progress = new Progress<string>(m => Status = m);
-            Transcript = (await _pipeline.TranscribeAsync(_recordingPath, progress)).Trim();
+            Transcript = (
+                await _pipeline.TranscribeAsync(
+                    _recordingPath,
+                    progress,
+                    CancellationToken.None,
+                    _loopbackTrack,
+                    _micTrack
+                )
+            ).Trim();
 
             Status = "Summarizing…";
             Summary = (await _pipeline.SummarizeAsync(Transcript, progress)).Trim();

@@ -7,7 +7,15 @@ using NAudio.Wave;
 namespace MeetingTranscriber.App.Services;
 
 /// <summary>Result of a completed recording session.</summary>
-public sealed record RecordingResult(string Path, float DurationSeconds, bool Interrupted = false);
+public sealed record RecordingResult(
+    string Path,
+    float DurationSeconds,
+    bool Interrupted = false,
+    int LoopbackSignalPct = 0,
+    int MicSignalPct = 0,
+    string? LoopbackTrack = null,
+    string? MicTrack = null
+);
 
 /// <summary>An interrupted recording left by a previous app run, recoverable via resume.</summary>
 public sealed record InterruptedSession(string WavPath, string? LoopbackId, string? MicId);
@@ -49,10 +57,15 @@ public sealed class RecordingService : IDisposable
     }
 
     private static readonly WaveFormat OutputFormat = new(48000, 16, 2);
+    private static readonly WaveFormat TrackFormat = new(48000, 16, 1);
 
     private readonly object _sync = new();
     private AudioMixer? _mixer;
     private WavSink? _sink;
+    private WavSink? _loopbackTrackSink;
+    private WavSink? _micTrackSink;
+    private string _loopbackTrackPath = string.Empty;
+    private string? _micTrackPath;
     private Thread? _mixThread;
     private WasapiCapture? _loopback;
     private WasapiCapture? _mic;
@@ -64,6 +77,11 @@ public sealed class RecordingService : IDisposable
     private volatile bool _sawUnexpectedLoss;
     private long _lastNonZeroSample = -1;
     private long _preexistingSamples = 0;
+    private string _debugLogPath = string.Empty;
+    private long _lastDiagSec = -1;
+    private readonly float[] _trackFloat = new float[4800];
+    private readonly short[] _trackShort = new short[4800];
+    private readonly byte[] _trackByte = new byte[9600];
     private string _outputPath = string.Empty;
 
     public bool IsRecording => _running;
@@ -94,7 +112,7 @@ public sealed class RecordingService : IDisposable
                     outputDir,
                     DateTime.Now.ToString("yyyyMMdd_HHmmss") + ".wav"
                 );
-
+            _debugLogPath = System.IO.Path.Combine(outputDir, "recording_debug.log");
             _mixer = new AudioMixer(48000, 2);
             _sawUnexpectedLoss = false;
             _stopping = false;
@@ -125,9 +143,37 @@ public sealed class RecordingService : IDisposable
                 if (_micState != null)
                     LaunchCapture(_micState, micDevice!);
 
-                _sink = new WavSink(_outputPath, append: continueFromPath != null);
+                _sink = new WavSink(_outputPath, OutputFormat, append: continueFromPath != null);
                 _preexistingSamples = _sink.PreexistingSamples;
+
+                // Sidecar per-source mono tracks for dual-stream transcription.
+                var baseName = System.IO.Path.ChangeExtension(_outputPath, null);
+                _loopbackTrackPath = baseName + "_loopback.wav";
+                _loopbackTrackSink = new WavSink(
+                    _loopbackTrackPath,
+                    TrackFormat,
+                    append: continueFromPath != null
+                );
+                if (_micState != null)
+                {
+                    _micTrackPath = baseName + "_mic.wav";
+                    _micTrackSink = new WavSink(
+                        _micTrackPath,
+                        TrackFormat,
+                        append: continueFromPath != null
+                    );
+                }
+
                 WriteSessionMarker(loopbackDevice.ID, micDevice?.ID);
+                Log(
+                    $"session start | wav={_outputPath} append={continueFromPath != null} | "
+                        + $"loopback={loopbackDevice.FriendlyName} [{loopbackDevice.ID}] fmt={(_loopbackState?.Format?.SampleRate ?? 0)}/{_loopbackState?.Format?.Channels ?? 0} get->{_loopbackState?.Format?.Encoding}"
+                        + (
+                            micDevice != null
+                                ? $" | mic={micDevice.FriendlyName} [{micDevice.ID}] fmt={(_micState?.Format?.SampleRate ?? 0)}/{_micState?.Format?.Channels ?? 0}"
+                                : " | mic=none"
+                        )
+                );
                 var chunk = new float[9600]; // 100 ms of 48 kHz stereo
 
                 _mixThread = new Thread(() => MixLoop(chunk))
@@ -136,9 +182,9 @@ public sealed class RecordingService : IDisposable
                     Name = "MeetingMixer",
                 };
 
-                _loopbackState.Alive = true;
-                if (_micState != null)
-                    _micState.Alive = true;
+                _loopbackState!.Alive = true;
+                if (_micState is { } micState)
+                    micState.Alive = true;
 
                 _running = true;
                 _mixThread.Start();
@@ -224,6 +270,12 @@ public sealed class RecordingService : IDisposable
         if (File.Exists(path))
             duration = new FileInfo(path).Length / (float)bytesPerSecond;
 
+        // Capture per-source coverage before the mixer/state is torn down.
+        var loopbackPct = SignalPct(_loopbackState?.MixerSource);
+        var micPct = SignalPct(_micState?.MixerSource);
+        var loopArr = _loopbackState?.MixerSource?.ArrivedSamples ?? 0;
+        var micArr = _micState?.MixerSource?.ArrivedSamples ?? 0;
+
         _loopback?.Dispose();
         _loopback = null;
         _mic?.Dispose();
@@ -239,7 +291,21 @@ public sealed class RecordingService : IDisposable
         // mistaking the just-stopped capture for an unexpected loss (which would start
         // spurious reconnects).
 
-        var result = new RecordingResult(path, duration, Interrupted: _sawUnexpectedLoss);
+        var result = new RecordingResult(
+            path,
+            duration,
+            Interrupted: _sawUnexpectedLoss,
+            LoopbackSignalPct: loopbackPct,
+            MicSignalPct: micPct,
+            LoopbackTrack: _loopbackTrackPath.Length > 0 ? _loopbackTrackPath : null,
+            MicTrack: _micTrackPath
+        );
+        Log(
+            $"stop | dur={duration:F1}s bytes={new FileInfo(path).Length} interrupted={_sawUnexpectedLoss} "
+                + $"loopback sig%={loopbackPct} (arr={loopArr}) "
+                + $"mic sig%={micPct} (arr={micArr})"
+        );
+        Log($"tracks: loop={_loopbackTrackPath} mic={_micTrackPath ?? "none"}");
         RecordingStopped?.Invoke(result);
         return result;
     }
@@ -277,7 +343,13 @@ public sealed class RecordingService : IDisposable
                     // start a new mixer stream; the old one is finished.
                     if (state.MixerSource != null)
                         _mixer!.CompleteSource(state.MixerSource);
-                    source = _mixer!.AddSource(format, state.Gain);
+                    source = _mixer!.AddSource(
+                        format,
+                        state.Gain,
+                        role: state.Kind == SourceKind.Loopback
+                            ? AudioMixer.SourceRole.Loopback
+                            : AudioMixer.SourceRole.Mic
+                    );
                     state.MixerSource = source;
                 }
                 state.Format = format;
@@ -331,6 +403,8 @@ public sealed class RecordingService : IDisposable
 
         _sawUnexpectedLoss = true;
         state.Reconnecting = true;
+        var label = state.Kind == SourceKind.Loopback ? "loopback" : "mic";
+        Log($"stream lost: {label} ex={(args.Exception?.Message ?? "none")}");
         RecordingStatusChanged?.Invoke(
             $"{(state.Kind == SourceKind.Loopback ? "Speaker output" : "Microphone")} stream lost — reconnecting…"
         );
@@ -381,6 +455,7 @@ public sealed class RecordingService : IDisposable
                     state.Reconnecting = false;
                 }
                 RecordingStatusChanged?.Invoke($"{label} reconnected.");
+                Log($"reconnected: {label}");
                 return;
             }
             catch
@@ -406,6 +481,7 @@ public sealed class RecordingService : IDisposable
         if (allGone)
         {
             RecordingStatusChanged?.Invoke("All audio streams lost — stopping recording.");
+            Log("all sources lost — auto-stopping");
             lock (_sync)
             {
                 if (_running)
@@ -417,6 +493,7 @@ public sealed class RecordingService : IDisposable
             RecordingStatusChanged?.Invoke(
                 $"{label} unavailable — recording continues with the remaining source."
             );
+            Log($"gave up reconnect: {label}");
         }
     }
 
@@ -539,6 +616,9 @@ public sealed class RecordingService : IDisposable
                     totalSamples += count;
                     writtenSamples += count;
                 }
+
+                // Sidecar mono tracks (same real-time pacing; frames = samples/2).
+                WriteTracks(budget / 2);
             }
 
             // The resampler streams an endless tail of zeros once its input drains, so
@@ -558,9 +638,94 @@ public sealed class RecordingService : IDisposable
             }
 
             Thread.Sleep(2);
+
+            // Diagnostics: one line per second with per-source levels and buffer state.
+            {
+                var sec = (long)clock.Elapsed.TotalSeconds;
+                if (sec != _lastDiagSec)
+                {
+                    _lastDiagSec = sec;
+                    var sb = new System.Text.StringBuilder();
+                    sb.Append("sec=")
+                        .Append(sec)
+                        .Append(" t=")
+                        .Append(clock.Elapsed.TotalSeconds.ToString("F1"));
+                    AppendSourceDiag(sb, "loop", _loopbackState?.MixerSource);
+                    AppendSourceDiag(sb, "mic", _micState?.MixerSource);
+                    Log(sb.ToString());
+
+                    var loopPeak = _loopbackState?.MixerSource?.LastPeak ?? 0f;
+                    var micPeak = _micState?.MixerSource?.LastPeak ?? 0f;
+                    RecordingStatusChanged?.Invoke(
+                        $"Recording… (t={sec}s)  speaker {loopPeak:F2}  |  mic {micPeak:F2}"
+                    );
+                }
+            }
         }
 
         _sink?.Flush();
+        _loopbackTrackSink?.Flush();
+        _micTrackSink?.Flush();
+        Log($"mix thread ended (written={writtenSamples})");
+    }
+
+    /// <summary>Writes the per-source mono sidecar tracks, paced by the same budget.</summary>
+    private void WriteTracks(int maxFrames)
+    {
+        if (_loopbackTrackSink != null && _loopbackState?.MixerSource is { } loopSrc)
+            WriteTrack(_loopbackTrackSink, loopSrc, maxFrames);
+        if (_micTrackSink != null && _micState?.MixerSource is { } micSrc)
+            WriteTrack(_micTrackSink, micSrc, maxFrames);
+    }
+
+    private void WriteTrack(WavSink sink, AudioMixer.Source source, int maxSamples)
+    {
+        if (maxSamples > _trackFloat.Length)
+            maxSamples = _trackFloat.Length;
+        if (maxSamples <= 0)
+            return;
+
+        var read = _mixer!.ReadTrack(source, _trackFloat, maxSamples);
+        if (read <= 0)
+            return;
+
+        for (int i = 0; i < read; i++)
+        {
+            var v = _trackFloat[i] * 32767f;
+            _trackShort[i] = (short)(
+                v > 32767f ? 32767
+                : v < -32768f ? -32768
+                : (short)v
+            );
+        }
+        Buffer.BlockCopy(_trackShort, 0, _trackByte, 0, read * 2);
+        sink.WriteData(_trackByte, read * 2);
+    }
+
+    private static void AppendSourceDiag(
+        System.Text.StringBuilder sb,
+        string name,
+        AudioMixer.Source? s
+    )
+    {
+        sb.Append(" | ")
+            .Append(name)
+            .Append(" peak=")
+            .Append(s?.LastPeak.ToString("F3") ?? "-")
+            .Append(" sig%=")
+            .Append(SignalPct(s))
+            .Append(" arr=")
+            .Append(s?.ArrivedSamples ?? 0)
+            .Append(" buf=")
+            .Append(s?.Buffer?.BufferedBytes ?? 0);
+        if (s?.Buffer != null)
+        {
+            var cap = (long)(
+                s.Buffer.BufferDuration.TotalSeconds * s.Buffer.WaveFormat.AverageBytesPerSecond
+            );
+            if (s.Buffer.BufferedBytes >= cap)
+                sb.Append(" FULL");
+        }
     }
 
     /// <summary>
@@ -686,6 +851,31 @@ public sealed class RecordingService : IDisposable
     private static string SessionMarkerPath =>
         System.IO.Path.Combine(Paths.RecordingsDir, SessionMarkerFileName);
 
+    /// <summary>Appends a line to the per-session debug log (best-effort).</summary>
+    private void Log(string line)
+    {
+        if (_debugLogPath.Length == 0)
+            return;
+        try
+        {
+            File.AppendAllText(
+                _debugLogPath,
+                DateTime.Now.ToString("HH:mm:ss.fff") + " " + line + Environment.NewLine
+            );
+        }
+        catch
+        {
+            // logging is best-effort
+        }
+    }
+
+    private static int SignalPct(AudioMixer.Source? source)
+    {
+        if (source is null || source.ArrivedSamples <= 0)
+            return 0;
+        return (int)Math.Round(100.0 * source.SignalSamples / source.ArrivedSamples);
+    }
+
     /// <summary>
     /// Returns the interrupted recording left by a previous app run (created at session
     /// start, deleted on a clean stop), or null if the last session finished normally.
@@ -773,7 +963,7 @@ public sealed class RecordingService : IDisposable
     {
         private readonly FileStream _stream;
 
-        public WavSink(string path, bool append)
+        public WavSink(string path, WaveFormat format, bool append)
         {
             if (append)
             {
@@ -790,7 +980,7 @@ public sealed class RecordingService : IDisposable
                     FileAccess.ReadWrite,
                     FileShare.Read
                 );
-                WritePcm16Header(_stream);
+                WritePcm16Header(_stream, format);
                 PreexistingSamples = 0;
             }
         }
@@ -843,9 +1033,10 @@ public sealed class RecordingService : IDisposable
             throw new InvalidDataException("WAV has no data chunk.");
         }
 
-        /// <summary>Writes a canonical 44-byte PCM16 48k stereo header with zeroed sizes.</summary>
-        private static void WritePcm16Header(Stream stream)
+        /// <summary>Writes a canonical 44-byte PCM16 header for the given format (sizes zeroed).</summary>
+        private static void WritePcm16Header(Stream stream, WaveFormat format)
         {
+            int blockAlign = format.Channels * (format.BitsPerSample / 8);
             using var w = new BinaryWriter(stream, System.Text.Encoding.UTF8, leaveOpen: true);
             w.Write("RIFF"u8);
             w.Write(0u); // RIFF size placeholder, patched later
@@ -853,11 +1044,11 @@ public sealed class RecordingService : IDisposable
             w.Write("fmt "u8);
             w.Write(16);
             w.Write((short)1); // PCM
-            w.Write((short)2); // channels
-            w.Write(48000);
-            w.Write(192000); // byte rate
-            w.Write((short)4); // block align
-            w.Write((short)16); // bits
+            w.Write((short)format.Channels);
+            w.Write(format.SampleRate);
+            w.Write(format.SampleRate * blockAlign); // byte rate
+            w.Write((short)blockAlign);
+            w.Write((short)format.BitsPerSample);
             w.Write("data"u8);
             w.Write(0u); // data size placeholder
         }

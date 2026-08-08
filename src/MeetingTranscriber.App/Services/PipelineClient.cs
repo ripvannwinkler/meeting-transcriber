@@ -1,5 +1,6 @@
 using System.Diagnostics;
 using System.IO;
+using System.Text;
 using System.Text.Json;
 
 namespace MeetingTranscriber.App.Services;
@@ -24,10 +25,16 @@ public sealed class PipelineClient : IConversationPipeline
     public async Task<string> TranscribeAsync(
         string wavPath,
         IProgress<string>? progress = null,
-        CancellationToken ct = default
+        CancellationToken ct = default,
+        string? loopbackTrack = null,
+        string? micTrack = null
     )
     {
         var args = $"\"{CliScript}\" transcribe \"{wavPath}\" --config \"{Paths.SettingsFile}\"";
+        if (loopbackTrack != null)
+            args += $" --loopback \"{loopbackTrack}\"";
+        if (micTrack != null)
+            args += $" --mic \"{micTrack}\"";
         return await RunBackendAsync(args, progress, ct);
     }
 
@@ -65,6 +72,11 @@ public sealed class PipelineClient : IConversationPipeline
             RedirectStandardOutput = true,
             RedirectStandardError = true,
             RedirectStandardInput = stdinText != null,
+            // Python emits UTF-8 (cli.py reconfigures stdout); without this the process
+            // reader defaults to the system ANSI code page and mangles non-ASCII text
+            // (e.g. '…' becomes 'â€¦').
+            StandardOutputEncoding = Encoding.UTF8,
+            StandardErrorEncoding = Encoding.UTF8,
             UseShellExecute = false,
             CreateNoWindow = true,
         };

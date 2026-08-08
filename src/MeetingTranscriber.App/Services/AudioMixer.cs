@@ -20,15 +20,35 @@ namespace MeetingTranscriber.App.Services;
 /// </summary>
 public sealed class AudioMixer : IDisposable
 {
+    /// <summary>Only samples above this magnitude count as "signal" for diagnostics.</summary>
+    private const float SignalThreshold = 0.005f;
+
+    /// <summary>Role of a capture source, used to name its sidecar track file.</summary>
+    public enum SourceRole
+    {
+        Loopback,
+        Mic,
+    }
+
     /// <summary>Identification for a single capture source added to the mixer.</summary>
     public sealed class Source
     {
         public required int Id { get; init; }
+        public SourceRole Role { get; init; } = SourceRole.Loopback;
         public float Gain { get; set; } = 1.0f;
         public bool Active { get; set; } = true;
         public bool Complete { get; set; }
         internal BufferedWaveProvider? Buffer;
         internal ISampleProvider? Provider;
+
+        // Second, independent pipeline feeding this source's sidecar track file (mono).
+        internal BufferedWaveProvider? TrackBuffer;
+        internal ISampleProvider? TrackProvider;
+
+        /// <summary>Diagnostics (updated by the mix thread; read snapshots by the recorder).</summary>
+        public float LastPeak; // max |sample| seen in the most recent read
+        public long SignalSamples; // samples above SignalThreshold
+        public long ArrivedSamples; // samples read in total
     }
 
     private readonly int _targetSampleRate;
@@ -50,7 +70,11 @@ public sealed class AudioMixer : IDisposable
     /// used by <see cref="Push"/>. The format should be IEEE-float; a best-effort
     /// conversion is attempted otherwise.
     /// </summary>
-    public Source AddSource(WaveFormat sourceFormat, float gain = 1.0f)
+    public Source AddSource(
+        WaveFormat sourceFormat,
+        float gain = 1.0f,
+        SourceRole role = SourceRole.Loopback
+    )
     {
         lock (_sync)
         {
@@ -79,15 +103,56 @@ public sealed class AudioMixer : IDisposable
                     $"Unsupported channel count {pipeline.WaveFormat.Channels}; expected 1 or {_channels}."
                 );
 
+            // Independent mono track pipeline (downmixed to 48k mono) for the sidecar file.
+            var trackBuf = new BufferedWaveProvider(floatFormat)
+            {
+                BufferDuration = TimeSpan.FromSeconds(5),
+                DiscardOnBufferOverflow = true,
+            };
+            ISampleProvider track = new WaveToSampleProvider(trackBuf);
+            if (track.WaveFormat.SampleRate != _targetSampleRate)
+                track = new WdlResamplingSampleProvider(track, _targetSampleRate);
+            if (track.WaveFormat.Channels > 1)
+                track = new StereoToMonoSampleProvider(track);
+
             var source = new Source
             {
                 Id = _sources.Count,
+                Role = role,
                 Gain = gain,
                 Buffer = bufferRef,
                 Provider = pipeline,
+                TrackBuffer = trackBuf,
+                TrackProvider = track,
             };
             _sources.Add(source);
             return source;
+        }
+    }
+
+    /// <summary>
+    /// Pulls up to <paramref name="maxSamples"/> mono samples from a source's sidecar track
+    /// pipeline. Returns the number of samples actually read.
+    /// </summary>
+    public int ReadTrack(Source source, float[] monoBuffer, int maxSamples)
+    {
+        lock (_sync)
+        {
+            if (!source.Active || source.TrackProvider is not { } provider)
+                return 0;
+            if (source.TrackBuffer is not { } buffer)
+                return 0;
+
+            int limit = Math.Min(maxSamples, monoBuffer.Length);
+            if (limit <= 0)
+                return 0;
+
+            int read;
+            lock (buffer)
+            {
+                read = provider.Read(monoBuffer, 0, limit);
+            }
+            return Math.Min(read, monoBuffer.Length);
         }
     }
 
@@ -118,6 +183,15 @@ public sealed class AudioMixer : IDisposable
         lock (buffer)
         {
             buffer.AddSamples(data, offset, count);
+        }
+
+        // Duplicate the same bytes into the source's sidecar track buffer.
+        if (source.TrackBuffer is { } trackBuf)
+        {
+            lock (trackBuf)
+            {
+                trackBuf.AddSamples(data, offset, count);
+            }
         }
     }
 
@@ -168,6 +242,19 @@ public sealed class AudioMixer : IDisposable
 
                 if (read > 0)
                 {
+                    float peak = 0f;
+                    for (int i = 0; i < read; i++)
+                    {
+                        float v = scratch[i];
+                        float abs = Math.Abs(v);
+                        if (abs > peak)
+                            peak = abs;
+                        if (abs > SignalThreshold)
+                            source.SignalSamples++;
+                    }
+                    source.ArrivedSamples += read;
+                    source.LastPeak = peak;
+
                     for (int i = 0; i < read; i++)
                         frameBuffer[i] += scratch[i] * source.Gain;
 

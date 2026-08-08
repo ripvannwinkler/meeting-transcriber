@@ -7,11 +7,16 @@ namespace MeetingTranscriber.App.Services;
 /// </summary>
 public interface IConversationPipeline
 {
-    /// <summary>Transcribes a WAV file to plain text, reporting progress as it goes.</summary>
+    /// <summary>
+    /// Transcribes a WAV (optionally with separate loopback/mic tracks for dual-stream
+    /// transcription) to text, reporting progress as it goes.
+    /// </summary>
     Task<string> TranscribeAsync(
         string wavPath,
         IProgress<string>? progress = null,
-        CancellationToken ct = default
+        CancellationToken ct = default,
+        string? loopbackTrack = null,
+        string? micTrack = null
     );
 
     /// <summary>Summarizes a transcript into structured notes (key points, decisions, actions).</summary>

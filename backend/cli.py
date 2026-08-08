@@ -27,9 +27,11 @@ def main() -> int:
     sub = parser.add_subparsers(dest="command", required=True)
 
     t = sub.add_parser("transcribe", help="Transcribe a WAV to text")
-    t.add_argument("wav", help="Path to the WAV file")
+    t.add_argument("wav", help="Path to the mixed WAV file")
     t.add_argument("--config", default=None, help="Path to settings.json (defaults to repo root)")
     t.add_argument("--json", default=None, help="Optional path to also write plain JSON transcript")
+    t.add_argument("--loopback", default=None, help="Loopback-only track WAV (dual-track mode)")
+    t.add_argument("--mic", default=None, help="Mic-only track WAV (dual-track mode)")
 
     s = sub.add_parser("summarize", help="Summarize a transcript read from stdin")
     s.add_argument("--config", default=None, help="Path to settings.json (defaults to repo root)")
@@ -38,11 +40,14 @@ def main() -> int:
 
     if args.command == "transcribe":
         from config import load_settings
-        from transcribe import run_transcribe
+        from transcribe import run_transcribe, run_transcribe_tracks
 
         try:
             settings = load_settings(args.config)
-            run_transcribe(settings, args.wav, json_out=args.json)
+            if args.loopback and args.mic:
+                run_transcribe_tracks(settings, args.loopback, args.mic)
+            else:
+                run_transcribe(settings, args.wav, json_out=args.json)
         except FileNotFoundError as e:
             from transcribe import emit
 
