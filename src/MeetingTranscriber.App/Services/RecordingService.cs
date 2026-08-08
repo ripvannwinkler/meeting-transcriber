@@ -48,6 +48,7 @@ public sealed class RecordingService : IDisposable
     private readonly object _sync = new();
     private AudioMixer? _mixer;
     private WaveFileWriter? _writer;
+    private FileStream? _writerStream;
     private Thread? _mixThread;
     private WasapiCapture? _loopback;
     private WasapiCapture? _mic;
@@ -116,7 +117,13 @@ public sealed class RecordingService : IDisposable
                 if (_micState != null)
                     LaunchCapture(_micState, micDevice!);
 
-                _writer = new WaveFileWriter(_outputPath, OutputFormat);
+                _writerStream = new FileStream(
+                    _outputPath,
+                    FileMode.Create,
+                    FileAccess.ReadWrite,
+                    FileShare.ReadWrite
+                );
+                _writer = new WaveFileWriter(_writerStream, OutputFormat);
                 var chunk = new float[9600]; // 100 ms of 48 kHz stereo
 
                 _mixThread = new Thread(() => MixLoop(chunk))
@@ -202,6 +209,11 @@ public sealed class RecordingService : IDisposable
         {
             _writer.Dispose();
             _writer = null;
+        }
+        if (_writerStream != null)
+        {
+            _writerStream.Dispose();
+            _writerStream = null;
         }
 
         // Trim the trailing silence the resampler padded the recording with.
@@ -462,9 +474,32 @@ public sealed class RecordingService : IDisposable
         var clock = Stopwatch.StartNew();
         long writtenSamples = 0;
         long drainedSinceMs = -1;
+        long lastHeaderPatchMs = 0;
 
         while (true)
         {
+            // Crash-safety: periodically finalize the WAV header on disk so that if the
+            // process dies mid-recording, the file up to that point is still readable.
+            if (
+                _writerStream != null
+                && clock.Elapsed.TotalMilliseconds - lastHeaderPatchMs >= 5000
+            )
+            {
+                lastHeaderPatchMs = (long)clock.Elapsed.TotalMilliseconds;
+                try
+                {
+                    _writer?.Flush();
+                    var fs = _writerStream;
+                    var pos = fs.Position;
+                    PatchWaveHeader(fs);
+                    fs.Position = pos;
+                }
+                catch
+                {
+                    // Patching is best-effort; recording continues either way.
+                }
+            }
+
             bool drained = _stopRequested && _mixer!.IsDrained;
 
             int budget;
@@ -531,6 +566,38 @@ public sealed class RecordingService : IDisposable
 
         if (_writer != null)
             _writer.Flush();
+    }
+
+    /// <summary>
+    /// Rewrites the RIFF/data chunk sizes in the header to match the file's current
+    /// length (no truncation). Used periodically during recording so a crash leaves
+    /// a readable WAV; the caller should restore the stream position afterwards.
+    /// </summary>
+    private static void PatchWaveHeader(FileStream fs)
+    {
+        if (fs.Length < 12)
+            return;
+
+        long pos = 12;
+        var chunkHeader = new byte[8];
+        while (pos + 8 <= fs.Length)
+        {
+            fs.Seek(pos, SeekOrigin.Begin);
+            fs.ReadExactly(chunkHeader, 0, 8);
+            uint tag = BitConverter.ToUInt32(chunkHeader, 0);
+            uint size = BitConverter.ToUInt32(chunkHeader, 4);
+            if (tag == 0x61746164u) // "data"
+            {
+                var fileLength = fs.Length;
+                fs.Seek(4, SeekOrigin.Begin);
+                fs.Write(BitConverter.GetBytes(fileLength - 8), 0, 4);
+                fs.Seek(pos + 4, SeekOrigin.Begin);
+                fs.Write(BitConverter.GetBytes(fileLength - (pos + 8)), 0, 4);
+                fs.Flush();
+                return;
+            }
+            pos += 8 + size + (size % 2);
+        }
     }
 
     /// <summary>
