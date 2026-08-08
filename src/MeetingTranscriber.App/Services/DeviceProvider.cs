@@ -2,6 +2,12 @@ using NAudio.CoreAudioApi;
 
 namespace MeetingTranscriber.App.Services;
 
+/// <summary>Bindable wrapper around an MMDevice for UI combo boxes.</summary>
+public sealed record DeviceOption(MMDevice Device, string Name)
+{
+    public override string ToString() => Name;
+}
+
 /// <summary>
 /// Enumerates Windows audio endpoints used by the recorder:
 /// rendered (playback) devices for WASAPI loopback capture of "speaker out",

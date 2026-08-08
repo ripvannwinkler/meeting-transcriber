@@ -2,16 +2,13 @@
   x:Class="MeetingTranscriber.App.MainWindow"
   xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
   xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
-  xmlns:d="http://schemas.microsoft.com/expression/blend/2008"
-  xmlns:mc="http://schemas.openxmlformats.org/markup-compatibility/2006"
-  mc:Ignorable="d"
   Title="Meeting Transcriber"
-  Height="450"
-  Width="560"
+  Height="600"
+  Width="760"
+  WindowStartupLocation="CenterScreen"
 >
-  <Grid Margin="16">
+  <Grid Margin="14">
     <Grid.RowDefinitions>
-      <RowDefinition Height="Auto" />
       <RowDefinition Height="Auto" />
       <RowDefinition Height="Auto" />
       <RowDefinition Height="Auto" />
@@ -19,43 +16,126 @@
       <RowDefinition Height="Auto" />
     </Grid.RowDefinitions>
 
-    <StackPanel Grid.Row="0">
-      <TextBlock FontWeight="Bold" Text="Speaker output device (loopback)" />
-      <ComboBox x:Name="LoopbackCombo" Margin="0,4,0,12" />
-      <TextBlock FontWeight="Bold" Text="Microphone" />
-      <ComboBox x:Name="MicCombo" Margin="0,4,0,12" />
-      <Label Content="Microphone gain" Padding="0" />
-      <Slider
-        x:Name="MicGainSlider"
-        Minimum="0"
-        Maximum="4"
-        Value="1"
-        TickFrequency="0.1"
-        IsSnapToTickEnabled="False"
-      />
-    </StackPanel>
+    <!-- Audio sources -->
+    <GroupBox Grid.Row="0" Header="Audio sources">
+      <Grid Margin="8">
+        <Grid.ColumnDefinitions>
+          <ColumnDefinition Width="*" />
+          <ColumnDefinition Width="Auto" />
+          <ColumnDefinition Width="*" />
+        </Grid.ColumnDefinitions>
+        <StackPanel Grid.Column="0">
+          <TextBlock Text="Speaker output (loopback)" />
+          <ComboBox
+            ItemsSource="{Binding PlaybackDevices}"
+            SelectedItem="{Binding SelectedPlayback}"
+            Margin="0,4,0,0"
+          />
+        </StackPanel>
+        <StackPanel Grid.Column="1" Margin="16,0">
+          <TextBlock Text="Mic gain" />
+          <Slider Minimum="0" Maximum="4" Value="{Binding MicGain}" Width="120" Margin="0,6,0,0" />
+        </StackPanel>
+        <StackPanel Grid.Column="2">
+          <TextBlock Text="Microphone" />
+          <ComboBox
+            ItemsSource="{Binding InputDevices}"
+            SelectedItem="{Binding SelectedInput}"
+            Margin="0,4,0,0"
+          />
+        </StackPanel>
+      </Grid>
+    </GroupBox>
 
-    <StackPanel Grid.Row="1" Orientation="Horizontal" Margin="0,12,0,8">
+    <!-- Transport controls -->
+    <StackPanel Grid.Row="1" Orientation="Horizontal" Margin="0,10,0,4">
       <Button
-        x:Name="StartButton"
         Content="Start Recording"
-        Width="140"
-        Padding="8,4"
-        Click="OnStartClick"
+        Command="{Binding StartRecordingCommand}"
+        Width="150"
+        Padding="8,5"
       />
       <Button
-        x:Name="StopButton"
         Content="Stop Recording"
-        Width="140"
-        Padding="8,4"
+        Command="{Binding StopRecordingCommand}"
+        Width="150"
+        Padding="8,5"
         Margin="8,0,0,0"
-        IsEnabled="False"
-        Click="OnStopClick"
+      />
+      <TextBlock
+        Text="{Binding TimerText}"
+        FontSize="22"
+        FontWeight="Bold"
+        VerticalAlignment="Center"
+        Margin="16,0,0,0"
+      />
+      <Button
+        Content="Settings…"
+        Command="{Binding OpenSettingsCommand}"
+        HorizontalAlignment="Right"
+        Padding="12,5"
+        Margin="16,0,0,0"
       />
     </StackPanel>
 
-    <TextBlock x:Name="TimerText" Grid.Row="2" FontSize="20" FontWeight="Bold" />
+    <!-- Status -->
+    <TextBlock Grid.Row="2" Text="{Binding Status}" TextWrapping="Wrap" Margin="0,4,0,8" />
 
-    <TextBlock x:Name="StatusText" Grid.Row="4" TextWrapping="Wrap" Margin="0,8,0,0" />
+    <!-- Results -->
+    <Grid Grid.Row="3">
+      <Grid.RowDefinitions>
+        <RowDefinition Height="Auto" />
+        <RowDefinition Height="*" />
+      </Grid.RowDefinitions>
+      <StackPanel Grid.Row="0" Orientation="Horizontal" Margin="0,0,0,6">
+        <Button
+          Content="Transcribe &amp; Summarize"
+          Command="{Binding TranscribeCommand}"
+          Padding="12,5"
+        />
+        <Button
+          Content="Save Transcript"
+          Command="{Binding SaveTranscriptCommand}"
+          Padding="10,5"
+          Margin="8,0,0,0"
+        />
+        <Button
+          Content="Copy Transcript"
+          Command="{Binding CopyTranscriptCommand}"
+          Padding="10,5"
+          Margin="8,0,0,0"
+        />
+        <Button
+          Content="Save Summary"
+          Command="{Binding SaveSummaryCommand}"
+          Padding="10,5"
+          Margin="8,0,0,0"
+        />
+      </StackPanel>
+      <TabControl Grid.Row="1">
+        <TabItem Header="Transcript">
+          <TextBox
+            Text="{Binding Transcript}"
+            IsReadOnly="True"
+            TextWrapping="Wrap"
+            AcceptsReturn="True"
+            VerticalScrollBarVisibility="Auto"
+            FontFamily="Consolas"
+            FontSize="13"
+          />
+        </TabItem>
+        <TabItem Header="Summary">
+          <TextBox
+            Text="{Binding Summary}"
+            IsReadOnly="True"
+            TextWrapping="Wrap"
+            AcceptsReturn="True"
+            VerticalScrollBarVisibility="Auto"
+            FontFamily="Consolas"
+            FontSize="13"
+          />
+        </TabItem>
+      </TabControl>
+    </Grid>
   </Grid>
 </Window>
