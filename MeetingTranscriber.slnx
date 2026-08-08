@@ -1,0 +1,5 @@
+<Solution>
+  <Folder Name="/src/">
+    <Project Path="src/MeetingTranscriber.App/MeetingTranscriber.App.csproj" />
+  </Folder>
+</Solution>

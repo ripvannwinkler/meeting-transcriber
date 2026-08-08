@@ -1,0 +1,16 @@
+{
+  "stt": {
+    "engine": "whisper",
+    "variant": "medium",
+    "cache_dir": "models/stt",
+    "auto_download": true,
+    "device": "cuda"
+  },
+  "api": {
+    "base_url": "http://localhost:1234/v1",
+    "api_key": "",
+    "model": "",
+    "max_tokens": 4096
+  },
+  "output_dir": "output"
+}

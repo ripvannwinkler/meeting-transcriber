@@ -1,0 +1,4 @@
+# Speech-to-text
+openai-whisper
+# HTTP client for the OpenAI-compatible summarization API
+requests

@@ -1,0 +1,23 @@
+# Build output
+bin/
+obj/
+*.user
+
+# Recordings and generated output
+recordings/
+output/
+
+# Python backend
+backend/.venv/
+__pycache__/
+*.pyc
+backend/.env
+
+# Local config (contains API key)
+settings.json
+
+# OS / editor
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/
