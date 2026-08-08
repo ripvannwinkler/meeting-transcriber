@@ -70,11 +70,18 @@
         Margin="16,0,0,0"
       />
       <Button
+        Content="Open Recording…"
+        Command="{Binding OpenRecordingCommand}"
+        HorizontalAlignment="Right"
+        Padding="12,5"
+        Margin="16,0,0,0"
+      />
+      <Button
         Content="Settings…"
         Command="{Binding OpenSettingsCommand}"
         HorizontalAlignment="Right"
         Padding="12,5"
-        Margin="16,0,0,0"
+        Margin="8,0,0,0"
       />
     </StackPanel>
 

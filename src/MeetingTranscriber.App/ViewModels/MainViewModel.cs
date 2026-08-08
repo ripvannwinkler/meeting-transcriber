@@ -41,6 +41,10 @@ public sealed class MainViewModel : ObservableObject, IDisposable
         );
         StopRecordingCommand = new RelayCommand(_ => StopRecording(), _ => IsRecording);
         OpenSettingsCommand = new RelayCommand(_ => OpenSettings(), _ => !IsRecording);
+        OpenRecordingCommand = new RelayCommand(
+            _ => OpenRecording(),
+            _ => !IsRecording && !IsProcessing
+        );
         TranscribeCommand = new RelayCommand(
             _ => _ = RunTranscriptAsync(),
             _ => HasRecording && !IsProcessing
@@ -75,6 +79,7 @@ public sealed class MainViewModel : ObservableObject, IDisposable
     public RelayCommand StartRecordingCommand { get; }
     public RelayCommand StopRecordingCommand { get; }
     public RelayCommand OpenSettingsCommand { get; }
+    public RelayCommand OpenRecordingCommand { get; }
     public RelayCommand TranscribeCommand { get; }
     public RelayCommand SaveTranscriptCommand { get; }
     public RelayCommand CopyTranscriptCommand { get; }
@@ -111,6 +116,7 @@ public sealed class MainViewModel : ObservableObject, IDisposable
                 StartRecordingCommand.RaiseCanExecuteChanged();
                 StopRecordingCommand.RaiseCanExecuteChanged();
                 OpenSettingsCommand.RaiseCanExecuteChanged();
+                OpenRecordingCommand.RaiseCanExecuteChanged();
             }
         }
     }
@@ -154,7 +160,10 @@ public sealed class MainViewModel : ObservableObject, IDisposable
         private set
         {
             if (Set(ref _isProcessing, value))
+            {
                 TranscribeCommand.RaiseCanExecuteChanged();
+                OpenRecordingCommand.RaiseCanExecuteChanged();
+            }
         }
     }
 
@@ -214,9 +223,36 @@ public sealed class MainViewModel : ObservableObject, IDisposable
     {
         IsRecording = false;
         _recordingPath = r.Path;
+        TranscribeCommand.RaiseCanExecuteChanged();
         Status = r.Interrupted
             ? $"Saved: {r.Path} ({r.DurationSeconds:F1}s) — an audio stream dropped during recording, so there is a gap in the audio."
             : $"Saved: {r.Path} ({r.DurationSeconds:F1}s)";
+    }
+
+    /// <summary>
+    /// Loads an existing WAV (e.g. from a previous session after a restart) so it can be
+    /// transcribed and summarized without re-recording.
+    /// </summary>
+    private void OpenRecording()
+    {
+        if (IsRecording || IsProcessing)
+            return;
+
+        var dialog = new Microsoft.Win32.OpenFileDialog
+        {
+            Title = "Open a recording",
+            Filter = "WAV files (*.wav)|*.wav|All files (*.*)|*.*",
+            InitialDirectory = Paths.RecordingsDir,
+        };
+        if (dialog.ShowDialog() != true)
+            return;
+
+        _recordingPath = dialog.FileName;
+        Transcript = "";
+        Summary = "";
+        TimerText = "";
+        Status = $"Loaded: {dialog.FileName}";
+        TranscribeCommand.RaiseCanExecuteChanged();
     }
 
     /// <summary>Posts an action to the UI thread, tolerating dispatcher shutdown.</summary>

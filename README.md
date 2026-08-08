@@ -84,6 +84,17 @@ models/stt/                   Whisper model cache (git-ignored)
 settings.json                 local config, git-ignored
 ```
 
+## Recovering a recording after a restart
+
+Recordings are written incrementally to `recordings\` and survive app restarts.
+To transcribe/summarize one from a fresh session instead of re-recording:
+
+- **In the app:** press **Open Recording…**, pick the WAV, then **Transcribe & Summarize**.
+- **CLI fallback (manual):**
+  ```powershell
+  backend\.venv\Scripts\python.exe backend\cli.py transcribe recordings\<name>.wav --json output\transcript.json
+  ```
+
 ## Development notes
 
 - Backend contract: newline-delimited JSON (NDJSON) on stdout —

@@ -42,7 +42,7 @@ def main() -> int:
 
         try:
             settings = load_settings(args.config)
-            run_transcribe(settings, args.wav)
+            run_transcribe(settings, args.wav, json_out=args.json)
         except FileNotFoundError as e:
             from transcribe import emit
 

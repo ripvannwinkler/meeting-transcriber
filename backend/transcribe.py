@@ -29,7 +29,7 @@ def _load_whisper():
     return whisper
 
 
-def run_transcribe(settings, wav_path: str | Path) -> None:
+def run_transcribe(settings, wav_path: str | Path, json_out: str | Path | None = None) -> None:
     """Transcribe a WAV and stream NDJSON results to stdout."""
     import torch  # from whisper's dependency; fine to import here
 
@@ -80,3 +80,12 @@ def run_transcribe(settings, wav_path: str | Path) -> None:
 
     emit({"type": "transcript", "text": "\n".join(lines)})
     emit({"type": "done"})
+
+    # Optional plain output for manual/failed-UI recovery: write the transcript text
+    # to a file so it survives even if the app never receives the NDJSON stream.
+    if json_out is not None:
+        import json as _json
+
+        Path(json_out).parent.mkdir(parents=True, exist_ok=True)
+        with open(json_out, "w", encoding="utf-8") as fh:
+            _json.dump({"text": "\n".join(lines)}, fh, ensure_ascii=False, indent=2)
