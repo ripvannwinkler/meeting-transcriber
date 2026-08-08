@@ -95,6 +95,15 @@ To transcribe/summarize one from a fresh session instead of re-recording:
   backend\.venv\Scripts\python.exe backend\cli.py transcribe recordings\<name>.wav --json output\transcript.json
   ```
 
+## Resuming an interrupted recording
+
+If the app crashes *mid-recording*, the next launch detects the interrupted
+session (a `.session.json` marker left behind, deleted on clean stop) and shows
+**Resume Recording…**. Resuming appends new audio to the *same* WAV (the clock
+gap while the app was down is simply missing audio), with the header kept valid
+every 5 s so a crash never loses more than a few seconds of restorability.
+Alternatively, open the file manually via **Open Recording…**.
+
 ## Development notes
 
 - Backend contract: newline-delimited JSON (NDJSON) on stdout —

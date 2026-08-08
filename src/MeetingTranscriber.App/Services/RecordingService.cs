@@ -1,5 +1,6 @@
 using System.Diagnostics;
 using System.IO;
+using System.Text.Json;
 using NAudio.CoreAudioApi;
 using NAudio.Wave;
 
@@ -7,6 +8,9 @@ namespace MeetingTranscriber.App.Services;
 
 /// <summary>Result of a completed recording session.</summary>
 public sealed record RecordingResult(string Path, float DurationSeconds, bool Interrupted = false);
+
+/// <summary>An interrupted recording left by a previous app run, recoverable via resume.</summary>
+public sealed record InterruptedSession(string WavPath, string? LoopbackId, string? MicId);
 
 /// <summary>
 /// Captures system audio (WASAPI loopback = "speaker out") and an optional
@@ -23,6 +27,7 @@ public sealed class RecordingService : IDisposable
 {
     private const int MaxReconnectAttempts = 5;
     private static readonly TimeSpan ReconnectDelay = TimeSpan.FromSeconds(1);
+    private const string SessionMarkerFileName = ".session.json";
 
     private enum SourceKind
     {
@@ -47,8 +52,7 @@ public sealed class RecordingService : IDisposable
 
     private readonly object _sync = new();
     private AudioMixer? _mixer;
-    private WaveFileWriter? _writer;
-    private FileStream? _writerStream;
+    private WavSink? _sink;
     private Thread? _mixThread;
     private WasapiCapture? _loopback;
     private WasapiCapture? _mic;
@@ -59,6 +63,7 @@ public sealed class RecordingService : IDisposable
     private volatile bool _stopRequested;
     private volatile bool _sawUnexpectedLoss;
     private long _lastNonZeroSample = -1;
+    private long _preexistingSamples = 0;
     private string _outputPath = string.Empty;
 
     public bool IsRecording => _running;
@@ -73,7 +78,8 @@ public sealed class RecordingService : IDisposable
         MMDevice loopbackDevice,
         MMDevice? micDevice,
         float micGain,
-        string outputDir
+        string outputDir,
+        string? continueFromPath = null
     )
     {
         lock (_sync)
@@ -82,10 +88,12 @@ public sealed class RecordingService : IDisposable
                 return;
 
             Directory.CreateDirectory(outputDir);
-            _outputPath = System.IO.Path.Combine(
-                outputDir,
-                DateTime.Now.ToString("yyyyMMdd_HHmmss") + ".wav"
-            );
+            _outputPath =
+                continueFromPath
+                ?? System.IO.Path.Combine(
+                    outputDir,
+                    DateTime.Now.ToString("yyyyMMdd_HHmmss") + ".wav"
+                );
 
             _mixer = new AudioMixer(48000, 2);
             _sawUnexpectedLoss = false;
@@ -117,13 +125,9 @@ public sealed class RecordingService : IDisposable
                 if (_micState != null)
                     LaunchCapture(_micState, micDevice!);
 
-                _writerStream = new FileStream(
-                    _outputPath,
-                    FileMode.Create,
-                    FileAccess.ReadWrite,
-                    FileShare.ReadWrite
-                );
-                _writer = new WaveFileWriter(_writerStream, OutputFormat);
+                _sink = new WavSink(_outputPath, append: continueFromPath != null);
+                _preexistingSamples = _sink.PreexistingSamples;
+                WriteSessionMarker(loopbackDevice.ID, micDevice?.ID);
                 var chunk = new float[9600]; // 100 ms of 48 kHz stereo
 
                 _mixThread = new Thread(() => MixLoop(chunk))
@@ -205,16 +209,12 @@ public sealed class RecordingService : IDisposable
         int bytesPerSecond =
             OutputFormat.SampleRate * OutputFormat.Channels * (OutputFormat.BitsPerSample / 8);
         var duration = 0f;
-        if (_writer != null)
+        if (_sink != null)
         {
-            _writer.Dispose();
-            _writer = null;
+            _sink.Dispose();
+            _sink = null;
         }
-        if (_writerStream != null)
-        {
-            _writerStream.Dispose();
-            _writerStream = null;
-        }
+        DeleteSessionMarker();
 
         // Trim the trailing silence the resampler padded the recording with.
         if (_lastNonZeroSample >= 0)
@@ -463,8 +463,10 @@ public sealed class RecordingService : IDisposable
     {
         var shortBuf = new short[chunk.Length];
         var byteBuf = new byte[chunk.Length * 2];
-        long totalSamples = 0;
-        _lastNonZeroSample = -1; // last non-zero sample index, for trailing-silence trim
+        long totalSamples = _preexistingSamples;
+        // Absolute (whole-file) last non-zero sample index for trailing-silence trim, so a
+        // resume never trims away the pre-existing portion of the file.
+        _lastNonZeroSample = _preexistingSamples - 1;
 
         // Pacing: the recorder must write audio at exactly real time. If input buffers
         // deliver in bursts (WASAPI/WDL resampler jitter), reading greedily every loop
@@ -480,19 +482,13 @@ public sealed class RecordingService : IDisposable
         {
             // Crash-safety: periodically finalize the WAV header on disk so that if the
             // process dies mid-recording, the file up to that point is still readable.
-            if (
-                _writerStream != null
-                && clock.Elapsed.TotalMilliseconds - lastHeaderPatchMs >= 5000
-            )
+            if (_sink != null && clock.Elapsed.TotalMilliseconds - lastHeaderPatchMs >= 5000)
             {
                 lastHeaderPatchMs = (long)clock.Elapsed.TotalMilliseconds;
                 try
                 {
-                    _writer?.Flush();
-                    var fs = _writerStream;
-                    var pos = fs.Position;
-                    PatchWaveHeader(fs);
-                    fs.Position = pos;
+                    _sink.PatchHeader();
+                    TouchSessionMarker();
                 }
                 catch
                 {
@@ -539,7 +535,7 @@ public sealed class RecordingService : IDisposable
                             _lastNonZeroSample = totalSamples + i;
                     }
                     Buffer.BlockCopy(shortBuf, 0, byteBuf, 0, count * 2);
-                    _writer!.Write(byteBuf, 0, count * 2);
+                    _sink!.WriteData(byteBuf, count * 2);
                     totalSamples += count;
                     writtenSamples += count;
                 }
@@ -564,8 +560,7 @@ public sealed class RecordingService : IDisposable
             Thread.Sleep(2);
         }
 
-        if (_writer != null)
-            _writer.Flush();
+        _sink?.Flush();
     }
 
     /// <summary>
@@ -684,6 +679,188 @@ public sealed class RecordingService : IDisposable
         throw new NotSupportedException(
             $"Unsupported capture format: {format.Encoding} / {format.BitsPerSample}-bit."
         );
+    }
+
+    // ---------------- session marker (crash recovery) ----------------
+
+    private static string SessionMarkerPath =>
+        System.IO.Path.Combine(Paths.RecordingsDir, SessionMarkerFileName);
+
+    /// <summary>
+    /// Returns the interrupted recording left by a previous app run (created at session
+    /// start, deleted on a clean stop), or null if the last session finished normally.
+    /// </summary>
+    public static InterruptedSession? TryGetInterruptedSession()
+    {
+        try
+        {
+            var path = SessionMarkerPath;
+            if (!File.Exists(path))
+                return null;
+
+            using var doc = JsonDocument.Parse(File.ReadAllText(path));
+            var root = doc.RootElement;
+            var wav = root.TryGetProperty("wav", out var w) ? w.GetString() : null;
+            if (string.IsNullOrEmpty(wav) || !File.Exists(wav))
+                return null; // stale marker whose file is gone - ignore it
+
+            var loopbackId = root.TryGetProperty("loopbackId", out var l) ? l.GetString() : null;
+            var micId = root.TryGetProperty("micId", out var m) ? m.GetString() : null;
+            return new InterruptedSession(wav, loopbackId, micId);
+        }
+        catch
+        {
+            return null;
+        }
+    }
+
+    private void WriteSessionMarker(string loopbackId, string? micId)
+    {
+        try
+        {
+            Directory.CreateDirectory(Paths.RecordingsDir);
+            var data = JsonSerializer.Serialize(
+                new
+                {
+                    wav = _outputPath,
+                    loopbackId,
+                    micId,
+                    startedAt = DateTime.UtcNow.ToString("o"),
+                }
+            );
+            File.WriteAllText(SessionMarkerPath, data);
+        }
+        catch
+        {
+            // Marking is best-effort; recording continues regardless.
+        }
+    }
+
+    private void TouchSessionMarker()
+    {
+        try
+        {
+            File.SetLastWriteTimeUtc(SessionMarkerPath, DateTime.UtcNow);
+        }
+        catch
+        {
+            // best-effort
+        }
+    }
+
+    private void DeleteSessionMarker()
+    {
+        try
+        {
+            if (File.Exists(SessionMarkerPath))
+                File.Delete(SessionMarkerPath);
+        }
+        catch
+        {
+            // best-effort
+        }
+    }
+
+    // ---------------- WAV sink ----------------
+
+    /// <summary>
+    /// Minimal WAV writer. Unlike NAudio's WaveFileWriter (which writes a fresh header at
+    /// position 0 and can't append), this opens a file either fresh or in append mode so a
+    /// crashed session can be resumed into the same file. The header is patched on stop and
+    /// periodically by the caller (see <see cref="PatchHeader"/>).
+    /// </summary>
+    private sealed class WavSink : IDisposable
+    {
+        private readonly FileStream _stream;
+
+        public WavSink(string path, bool append)
+        {
+            if (append)
+            {
+                _stream = new FileStream(path, FileMode.Open, FileAccess.ReadWrite, FileShare.Read);
+                var dataStart = FindDataStart(_stream);
+                PreexistingSamples = (_stream.Length - dataStart) / 2;
+                _stream.Seek(0, SeekOrigin.End); // continue after existing audio
+            }
+            else
+            {
+                _stream = new FileStream(
+                    path,
+                    FileMode.Create,
+                    FileAccess.ReadWrite,
+                    FileShare.Read
+                );
+                WritePcm16Header(_stream);
+                PreexistingSamples = 0;
+            }
+        }
+
+        public void WriteData(byte[] data, int count) => _stream.Write(data, 0, count);
+
+        public void Flush()
+        {
+            lock (_stream)
+            {
+                _stream.Flush();
+            }
+        }
+
+        /// <summary>Rewrites the RIFF/data sizes to match the current file length.</summary>
+        public void PatchHeader()
+        {
+            lock (_stream)
+            {
+                var pos = _stream.Position;
+                PatchWaveHeader(_stream);
+                _stream.Position = pos;
+            }
+        }
+
+        /// <summary>Number of PCM samples already in the file before this session (0 for fresh).</summary>
+        public long PreexistingSamples { get; }
+
+        public void Dispose()
+        {
+            _stream.Flush();
+            _stream.Dispose();
+        }
+
+        /// <summary>Walks the RIFF chunk list to find the data chunk's start offset.</summary>
+        private static long FindDataStart(Stream stream)
+        {
+            stream.Position = 12;
+            var header = new byte[8];
+            while (stream.Position + 8 <= stream.Length)
+            {
+                long chunkStart = stream.Position;
+                stream.ReadExactly(header, 0, 8);
+                uint tag = BitConverter.ToUInt32(header, 0);
+                uint size = BitConverter.ToUInt32(header, 4);
+                if (tag == 0x61746164u) // "data"
+                    return chunkStart + 8;
+                stream.Position = chunkStart + 8 + size + (size % 2);
+            }
+            throw new InvalidDataException("WAV has no data chunk.");
+        }
+
+        /// <summary>Writes a canonical 44-byte PCM16 48k stereo header with zeroed sizes.</summary>
+        private static void WritePcm16Header(Stream stream)
+        {
+            using var w = new BinaryWriter(stream, System.Text.Encoding.UTF8, leaveOpen: true);
+            w.Write("RIFF"u8);
+            w.Write(0u); // RIFF size placeholder, patched later
+            w.Write("WAVE"u8);
+            w.Write("fmt "u8);
+            w.Write(16);
+            w.Write((short)1); // PCM
+            w.Write((short)2); // channels
+            w.Write(48000);
+            w.Write(192000); // byte rate
+            w.Write((short)4); // block align
+            w.Write((short)16); // bits
+            w.Write("data"u8);
+            w.Write(0u); // data size placeholder
+        }
     }
 
     public void Dispose() => StopRecording();

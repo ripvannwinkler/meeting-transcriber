@@ -77,6 +77,13 @@
         Margin="16,0,0,0"
       />
       <Button
+        Content="Resume Recording…"
+        Command="{Binding ResumeRecordingCommand}"
+        HorizontalAlignment="Right"
+        Padding="12,5"
+        Margin="8,0,0,0"
+      />
+      <Button
         Content="Settings…"
         Command="{Binding OpenSettingsCommand}"
         HorizontalAlignment="Right"

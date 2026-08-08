@@ -29,6 +29,7 @@ public sealed class MainViewModel : ObservableObject, IDisposable
     private string _summary = "";
     private bool _isProcessing;
     private string _recordingPath = "";
+    private InterruptedSession? _interruptedSession;
 
     public MainViewModel(IConversationPipeline pipeline)
     {
@@ -44,6 +45,10 @@ public sealed class MainViewModel : ObservableObject, IDisposable
         OpenRecordingCommand = new RelayCommand(
             _ => OpenRecording(),
             _ => !IsRecording && !IsProcessing
+        );
+        ResumeRecordingCommand = new RelayCommand(
+            _ => ResumeRecording(),
+            _ => HasInterruptedRecording && !IsRecording && !IsProcessing
         );
         TranscribeCommand = new RelayCommand(
             _ => _ = RunTranscriptAsync(),
@@ -67,6 +72,13 @@ public sealed class MainViewModel : ObservableObject, IDisposable
 
         _timer.Tick += (_, _) => TimerText = DateTime.Now.Subtract(_startedAt).ToString(@"mm\:ss");
 
+        // Detect a session from a previous run that was interrupted (e.g. a crash).
+        _interruptedSession = RecordingService.TryGetInterruptedSession();
+        if (_interruptedSession != null)
+            Status =
+                $"Found an interrupted recording: {_interruptedSession.WavPath} — press 'Resume Recording…' to continue it, or start a new one.";
+        ResumeRecordingCommand.RaiseCanExecuteChanged();
+
         // These can fire from background threads (capture threads / reconnect task), so
         // marshal every update onto the UI thread.
         _recorder.RecordingStopped += r => PostToUi(() => OnRecordingStopped(r));
@@ -80,6 +92,7 @@ public sealed class MainViewModel : ObservableObject, IDisposable
     public RelayCommand StopRecordingCommand { get; }
     public RelayCommand OpenSettingsCommand { get; }
     public RelayCommand OpenRecordingCommand { get; }
+    public RelayCommand ResumeRecordingCommand { get; }
     public RelayCommand TranscribeCommand { get; }
     public RelayCommand SaveTranscriptCommand { get; }
     public RelayCommand CopyTranscriptCommand { get; }
@@ -168,16 +181,66 @@ public sealed class MainViewModel : ObservableObject, IDisposable
     }
 
     public bool HasRecording => !string.IsNullOrEmpty(_recordingPath);
+    public bool HasInterruptedRecording => _interruptedSession != null;
     public bool HasTranscript => !string.IsNullOrWhiteSpace(Transcript);
     public bool HasSummary => !string.IsNullOrWhiteSpace(Summary);
 
     private void StartRecording()
     {
+        StartRecordingCore(
+            SelectedPlayback?.Device,
+            SelectedInput?.Device,
+            MicGain,
+            Paths.RecordingsDir,
+            continueFromPath: null
+        );
+    }
+
+    /// <summary>Continues an interrupted session into the same WAV, reusing its devices.</summary>
+    private void ResumeRecording()
+    {
+        if (IsRecording || IsProcessing || _interruptedSession is null)
+            return;
+
+        var session = _interruptedSession;
+        var loopback = FindDeviceById(PlaybackDevices, session.LoopbackId) ?? SelectedPlayback;
+        if (loopback is null)
+        {
+            Status =
+                "Cannot resume: the original speaker output device is unavailable. Pick one and start a new recording.";
+            return;
+        }
+
+        var mic =
+            session.MicId != null ? FindDeviceById(InputDevices, session.MicId) : SelectedInput;
+
+        IsRecording = false; // clear interrupted flag before starting the resumed session
+        StartRecordingCore(
+            loopback.Device,
+            mic?.Device,
+            MicGain,
+            Paths.RecordingsDir,
+            continueFromPath: session.WavPath
+        );
+    }
+
+    private void StartRecordingCore(
+        NAudio.CoreAudioApi.MMDevice? loopbackDevice,
+        NAudio.CoreAudioApi.MMDevice? micDevice,
+        float gain,
+        string outputDir,
+        string? continueFromPath
+    )
+    {
         if (IsRecording)
             return;
 
-        // Don't start if no loopback endpoint is selected (e.g. no devices on this machine).
-        if (SelectedPlayback is null)
+        // Consume any interrupted-session marker: starting (fresh or resume) supersedes it.
+        _interruptedSession = null;
+        ResumeRecordingCommand.RaiseCanExecuteChanged();
+
+        // Don't start if no loopback endpoint is available.
+        if (loopbackDevice is null)
         {
             Status = "No speaker output device available to record.";
             return;
@@ -194,13 +257,8 @@ public sealed class MainViewModel : ObservableObject, IDisposable
         {
             _timer.Start();
             IsRecording = true;
-            Status = "Recording…";
-            _recorder.StartRecording(
-                SelectedPlayback.Device,
-                SelectedInput?.Device,
-                MicGain,
-                Paths.RecordingsDir
-            );
+            Status = continueFromPath == null ? "Recording…" : $"Resuming… {continueFromPath}";
+            _recorder.StartRecording(loopbackDevice, micDevice, gain, outputDir, continueFromPath);
         }
         catch (Exception ex)
         {
@@ -210,6 +268,13 @@ public sealed class MainViewModel : ObservableObject, IDisposable
             IsRecording = false;
             Status = "Could not start recording: " + ex.Message;
         }
+    }
+
+    private static DeviceOption? FindDeviceById(IEnumerable<DeviceOption> options, string? id)
+    {
+        if (string.IsNullOrEmpty(id))
+            return null;
+        return options.FirstOrDefault(o => o.Device.ID == id);
     }
 
     private void StopRecording()
@@ -223,6 +288,9 @@ public sealed class MainViewModel : ObservableObject, IDisposable
     {
         IsRecording = false;
         _recordingPath = r.Path;
+        // A clean stop clears any interrupted-session state.
+        _interruptedSession = null;
+        ResumeRecordingCommand.RaiseCanExecuteChanged();
         TranscribeCommand.RaiseCanExecuteChanged();
         Status = r.Interrupted
             ? $"Saved: {r.Path} ({r.DurationSeconds:F1}s) — an audio stream dropped during recording, so there is a gap in the audio."
