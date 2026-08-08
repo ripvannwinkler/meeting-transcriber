@@ -15,6 +15,7 @@ public sealed class MainViewModel : ObservableObject, IDisposable
 {
     private readonly RecordingService _recorder = new();
     private readonly IConversationPipeline _pipeline;
+    private readonly Dispatcher _dispatcher = Application.Current.Dispatcher;
     private readonly DispatcherTimer _timer = new() { Interval = TimeSpan.FromMilliseconds(200) };
     private DateTime _startedAt;
 
@@ -61,7 +62,11 @@ public sealed class MainViewModel : ObservableObject, IDisposable
         SelectedInput = SelectDefault(InputDevices, DeviceProvider.GetDefaultInputDevice());
 
         _timer.Tick += (_, _) => TimerText = DateTime.Now.Subtract(_startedAt).ToString(@"mm\:ss");
-        _recorder.RecordingStopped += r => OnRecordingStopped(r);
+
+        // These can fire from background threads (capture threads / reconnect task), so
+        // marshal every update onto the UI thread.
+        _recorder.RecordingStopped += r => PostToUi(() => OnRecordingStopped(r));
+        _recorder.RecordingStatusChanged += msg => PostToUi(() => Status = msg);
     }
 
     public ObservableCollection<DeviceOption> PlaybackDevices { get; } = new();
@@ -209,7 +214,22 @@ public sealed class MainViewModel : ObservableObject, IDisposable
     {
         IsRecording = false;
         _recordingPath = r.Path;
-        Status = $"Saved: {r.Path} ({r.DurationSeconds:F1}s)";
+        Status = r.Interrupted
+            ? $"Saved: {r.Path} ({r.DurationSeconds:F1}s) — an audio stream dropped during recording, so there is a gap in the audio."
+            : $"Saved: {r.Path} ({r.DurationSeconds:F1}s)";
+    }
+
+    /// <summary>Posts an action to the UI thread, tolerating dispatcher shutdown.</summary>
+    private void PostToUi(Action action)
+    {
+        try
+        {
+            _dispatcher.BeginInvoke(action);
+        }
+        catch
+        {
+            // App is shutting down; drop the update.
+        }
     }
 
     private async Task RunTranscriptAsync()

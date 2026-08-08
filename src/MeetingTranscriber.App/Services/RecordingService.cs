@@ -1,4 +1,3 @@
-using System.Diagnostics;
 using System.IO;
 using NAudio.CoreAudioApi;
 using NAudio.Wave;
@@ -6,34 +5,67 @@ using NAudio.Wave;
 namespace MeetingTranscriber.App.Services;
 
 /// <summary>Result of a completed recording session.</summary>
-public sealed record RecordingResult(string Path, float DurationSeconds);
+public sealed record RecordingResult(string Path, float DurationSeconds, bool Interrupted = false);
 
 /// <summary>
 /// Captures system audio (WASAPI loopback = "speaker out") and an optional
 /// microphone simultaneously, mixes both into a single 48 kHz stereo stream via
 /// <see cref="AudioMixer"/>, and writes it to a WAV file on a background thread.
+///
+/// Resiliency: if a capture's stream dies mid-session (device unplugged, audio
+/// session lost, glitch), the source is re-opened by device ID with bounded
+/// retries. During the outage the surviving stream keeps recording (with a
+/// silence gap); if all configured sources are permanently lost the session
+/// finalizes itself. Every transition is surfaced via <see cref="RecordingStatusChanged"/>.
 /// </summary>
 public sealed class RecordingService : IDisposable
 {
+    private const int MaxReconnectAttempts = 5;
+    private static readonly TimeSpan ReconnectDelay = TimeSpan.FromSeconds(1);
+
+    private enum SourceKind
+    {
+        Loopback,
+        Mic,
+    }
+
+    private sealed class SourceState
+    {
+        public required SourceKind Kind;
+        public required string DeviceId;
+        public required float Gain;
+        public required bool Configured;
+        public volatile bool Alive; // a capture is currently feeding this source
+        public volatile bool Reconnecting; // a reconnect attempt is in flight
+        public int LossCount; // times this source was lost this session (under _sync)
+        public AudioMixer.Source? MixerSource;
+        public WaveFormat? Format;
+    }
+
     private static readonly WaveFormat OutputFormat = new(48000, 16, 2);
 
     private readonly object _sync = new();
     private AudioMixer? _mixer;
     private WaveFileWriter? _writer;
     private Thread? _mixThread;
-    private WasapiLoopbackCapture? _loopback;
+    private WasapiCapture? _loopback;
     private WasapiCapture? _mic;
-    private AudioMixer.Source? _loopbackSource;
-    private AudioMixer.Source? _micSource;
+    private SourceState? _loopbackState;
+    private SourceState? _micState;
     private volatile bool _running;
+    private volatile bool _stopping;
     private volatile bool _stopRequested;
+    private volatile bool _sawUnexpectedLoss;
     private long _lastNonZeroSample = -1;
     private string _outputPath = string.Empty;
 
     public bool IsRecording => _running;
 
-    /// <summary>Raised (on the UI thread marshaler) when recording ends with the result.</summary>
+    /// <summary>Raised (on the UI thread) when recording ends with the result.</summary>
     public event Action<RecordingResult>? RecordingStopped;
+
+    /// <summary>Raised (on a background thread) for live status messages during the session.</summary>
+    public event Action<string>? RecordingStatusChanged;
 
     public void StartRecording(
         MMDevice loopbackDevice,
@@ -54,48 +86,66 @@ public sealed class RecordingService : IDisposable
             );
 
             _mixer = new AudioMixer(48000, 2);
+            _sawUnexpectedLoss = false;
+            _stopping = false;
+            _stopRequested = false;
 
-            // --- System audio (loopback) ---
-            _loopback = new WasapiLoopbackCapture(loopbackDevice);
-            var loopbackFormat = _loopback.WaveFormat;
-            _loopbackSource = _mixer.AddSource(loopbackFormat, gain: 0.85f);
-            var loopbackSourceRef = _loopbackSource;
-            _loopback.DataAvailable += (_, e) =>
+            _loopbackState = new SourceState
             {
-                var floats = NormalizeToFloat(loopbackFormat, e.Buffer, e.BytesRecorded);
-                _mixer.Push(loopbackSourceRef.Id, floats, 0, floats.Length);
+                Kind = SourceKind.Loopback,
+                DeviceId = loopbackDevice.ID,
+                Gain = 0.85f,
+                Configured = true,
             };
-            _loopback.RecordingStopped += (_, _) => _mixer.CompleteSource(loopbackSourceRef);
 
-            // --- Microphone (optional) ---
             if (micDevice != null)
             {
-                _mic = new WasapiCapture(micDevice);
-                var micFormat = _mic.WaveFormat;
-                _micSource = _mixer.AddSource(micFormat, gain: Math.Clamp(micGain, 0f, 4f));
-                var micSourceRef = _micSource;
-                _mic.DataAvailable += (_, e) =>
+                _micState = new SourceState
                 {
-                    var floats = NormalizeToFloat(micFormat, e.Buffer, e.BytesRecorded);
-                    _mixer.Push(micSourceRef.Id, floats, 0, floats.Length);
+                    Kind = SourceKind.Mic,
+                    DeviceId = micDevice.ID,
+                    Gain = Math.Clamp(micGain, 0f, 4f),
+                    Configured = true,
                 };
-                _mic.RecordingStopped += (_, _) => _mixer.CompleteSource(micSourceRef);
             }
 
-            _writer = new WaveFileWriter(_outputPath, OutputFormat);
-            var chunk = new float[9600]; // 100 ms of 48 kHz stereo
-
-            _mixThread = new Thread(() => MixLoop(chunk))
+            try
             {
-                IsBackground = true,
-                Name = "MeetingMixer",
-            };
+                LaunchCapture(_loopbackState, loopbackDevice);
+                if (_micState != null)
+                    LaunchCapture(_micState, micDevice!);
 
-            _running = true;
-            _stopRequested = false;
-            _loopback.StartRecording();
-            _mic?.StartRecording();
-            _mixThread.Start();
+                _writer = new WaveFileWriter(_outputPath, OutputFormat);
+                var chunk = new float[9600]; // 100 ms of 48 kHz stereo
+
+                _mixThread = new Thread(() => MixLoop(chunk))
+                {
+                    IsBackground = true,
+                    Name = "MeetingMixer",
+                };
+
+                _loopbackState.Alive = true;
+                if (_micState != null)
+                    _micState.Alive = true;
+
+                _running = true;
+                _mixThread.Start();
+            }
+            catch
+            {
+                // Initial device init failed (e.g. endpoint vanished between selection
+                // and start): cleanup partial state and let the caller surface the error.
+                _loopback?.Dispose();
+                _mic?.Dispose();
+                _loopback = null;
+                _mic = null;
+                _mixer?.Dispose();
+                _mixer = null;
+                _loopbackState = null;
+                _micState = null;
+                _running = false;
+                throw;
+            }
         }
     }
 
@@ -105,65 +155,296 @@ public sealed class RecordingService : IDisposable
         {
             if (!_running)
                 return null;
-
-            _stopRequested = true;
-
-            // Stop captures; also explicitly complete sources so IsDrained resolves
-            // even if a RecordingStopped callback never fired.
-            try
-            {
-                _loopback?.StopRecording();
-            }
-            catch
-            { /* ignore */
-            }
-            try
-            {
-                _mic?.StopRecording();
-            }
-            catch
-            { /* ignore */
-            }
-            if (_loopbackSource != null)
-                _mixer?.CompleteSource(_loopbackSource);
-            if (_micSource != null)
-                _mixer?.CompleteSource(_micSource);
-
-            _mixThread?.Join(TimeSpan.FromSeconds(15));
-            _mixThread = null;
-
-            var path = _outputPath;
-            var duration = 0f;
-            if (_writer != null)
-            {
-                duration =
-                    _writer.Length
-                    / (float)(
-                        OutputFormat.SampleRate
-                        * OutputFormat.Channels
-                        * (OutputFormat.BitsPerSample / 8)
-                    );
-                _writer.Dispose();
-                _writer = null;
-            }
-
-            // Trim the trailing silence the resampler padded the recording with.
-            if (_lastNonZeroSample >= 0)
-                TrimWaveFile(path, (_lastNonZeroSample + 1) * 2);
-
-            _loopback?.Dispose();
-            _loopback = null;
-            _mic?.Dispose();
-            _mic = null;
-            _mixer?.Dispose();
-            _mixer = null;
-            _running = false;
-
-            var result = new RecordingResult(path, duration);
-            RecordingStopped?.Invoke(result);
-            return result;
+            return CompleteSession();
         }
     }
+
+    /// <summary>
+    /// Ends the session (called for both user stop and total-stream loss).
+    /// Caller must hold <see cref="_sync"/>.
+    /// </summary>
+    private RecordingResult CompleteSession()
+    {
+        _stopping = true; // suppresses reconnect logic in RecordingStopped handlers
+        _stopRequested = true;
+
+        try
+        {
+            _loopback?.StopRecording();
+        }
+        catch
+        { /* ignore */
+        }
+        try
+        {
+            _mic?.StopRecording();
+        }
+        catch
+        { /* ignore */
+        }
+
+        // Explicitly complete sources so IsDrained resolves even if a
+        // RecordingStopped callback never fired.
+        if (_loopbackState?.MixerSource != null)
+            _mixer?.CompleteSource(_loopbackState.MixerSource);
+        if (_micState?.MixerSource != null)
+            _mixer?.CompleteSource(_micState.MixerSource);
+
+        _mixThread?.Join(TimeSpan.FromSeconds(15));
+        _mixThread = null;
+
+        var path = _outputPath;
+        var duration = 0f;
+        if (_writer != null)
+        {
+            duration =
+                _writer.Length
+                / (float)(
+                    OutputFormat.SampleRate
+                    * OutputFormat.Channels
+                    * (OutputFormat.BitsPerSample / 8)
+                );
+            _writer.Dispose();
+            _writer = null;
+        }
+
+        // Trim the trailing silence the resampler padded the recording with.
+        if (_lastNonZeroSample >= 0)
+            TrimWaveFile(path, (_lastNonZeroSample + 1) * 2);
+
+        _loopback?.Dispose();
+        _loopback = null;
+        _mic?.Dispose();
+        _mic = null;
+        _mixer?.Dispose();
+        _mixer = null;
+        _loopbackState = null;
+        _micState = null;
+        _running = false;
+        // NOTE: _stopping intentionally stays true until the next session explicitly
+        // begins (StartRecording resets it). This prevents any RecordingStopped handler
+        // that was blocked on _sync during this shutdown from waking up afterwards and
+        // mistaking the just-stopped capture for an unexpected loss (which would start
+        // spurious reconnects).
+
+        var result = new RecordingResult(path, duration, Interrupted: _sawUnexpectedLoss);
+        RecordingStopped?.Invoke(result);
+        return result;
+    }
+
+    // ---------------- capture lifecycle / reconnect ----------------
+
+    /// <summary>
+    /// Creates the capture for <paramref name="state"/>, subscribes its handlers,
+    /// wires it into the mixer (reusing the source if the format is unchanged), and
+    /// starts it. Throws and cleans up on failure.
+    /// </summary>
+    private void LaunchCapture(SourceState state, MMDevice device)
+    {
+        var previous = GetCapture(state.Kind);
+        try
+        {
+            WasapiCapture capture =
+                state.Kind == SourceKind.Loopback
+                    ? new WasapiLoopbackCapture(device)
+                    : new WasapiCapture(device);
+            SetCapture(state.Kind, capture);
+
+            var format = capture.WaveFormat;
+            AudioMixer.Source source;
+            lock (_sync)
+            {
+                if (state.MixerSource != null && FormatsCompatible(state.Format!, format))
+                {
+                    source = state.MixerSource;
+                }
+                else
+                {
+                    // Format changed (e.g. different sample rate after reconnect):
+                    // start a new mixer stream; the old one is finished.
+                    if (state.MixerSource != null)
+                        _mixer!.CompleteSource(state.MixerSource);
+                    source = _mixer!.AddSource(format, state.Gain);
+                    state.MixerSource = source;
+                }
+                state.Format = format;
+            }
+
+            var sourceRef = source;
+            capture.DataAvailable += (_, e) =>
+            {
+                var floats = NormalizeToFloat(format, e.Buffer, e.BytesRecorded);
+                _mixer?.Push(sourceRef.Id, floats, 0, floats.Length);
+            };
+            capture.RecordingStopped += (_, e) => OnCaptureStopped(state, e);
+            capture.StartRecording();
+
+            // Superseded capture (e.g. the one that died and triggered this reconnect) is
+            // now finished and can be released. Not disposed until success so the failure
+            // path can restore it intact.
+            if (previous != null)
+            {
+                try
+                {
+                    previous.Dispose();
+                }
+                catch
+                { /* ignore */
+                }
+            }
+        }
+        catch
+        {
+            var capture = GetCapture(state.Kind);
+            if (capture != null)
+                capture.Dispose();
+            SetCapture(state.Kind, previous);
+            throw;
+        }
+    }
+
+    private void OnCaptureStopped(SourceState state, StoppedEventArgs args)
+    {
+        lock (_sync)
+        {
+            if (_stopping)
+            {
+                _mixer?.CompleteSource(state.MixerSource!);
+                return;
+            }
+            state.Alive = false;
+            state.LossCount++;
+        }
+
+        _sawUnexpectedLoss = true;
+        state.Reconnecting = true;
+        RecordingStatusChanged?.Invoke(
+            $"{(state.Kind == SourceKind.Loopback ? "Speaker output" : "Microphone")} stream lost — reconnecting…"
+        );
+        _ = Task.Run(() => ReconnectAsync(state));
+    }
+
+    private async Task ReconnectAsync(SourceState state)
+    {
+        var label = state.Kind == SourceKind.Loopback ? "Speaker output" : "Microphone";
+        for (int attempt = 1; attempt <= MaxReconnectAttempts; attempt++)
+        {
+            if (_stopping)
+                return;
+
+            // Bound by total losses this session, not just consecutive failures: a
+            // capture that re-opens but dies immediately again would otherwise retry forever.
+            if (state.LossCount > MaxReconnectAttempts)
+                break;
+            if (attempt == 1 || attempt == MaxReconnectAttempts)
+                RecordingStatusChanged?.Invoke(
+                    $"{label} unavailable (reconnect {attempt}/{MaxReconnectAttempts})…"
+                );
+
+            MMDevice? device;
+            try
+            {
+                device = FindDeviceById(state.DeviceId);
+            }
+            catch
+            {
+                device = null;
+            }
+
+            if (device == null || _stopping)
+            {
+                await Task.Delay(ReconnectDelay);
+                continue;
+            }
+
+            try
+            {
+                lock (_sync)
+                {
+                    if (_stopping)
+                        return;
+                    LaunchCapture(state, device);
+                    state.Alive = true;
+                    state.Reconnecting = false;
+                }
+                RecordingStatusChanged?.Invoke($"{label} reconnected.");
+                return;
+            }
+            catch
+            {
+                // Endpoint not ready yet (device still unplugged / busy) — retry.
+            }
+
+            await Task.Delay(ReconnectDelay);
+        }
+
+        // Permanent loss of this source.
+        bool allGone;
+        lock (_sync)
+        {
+            state.Reconnecting = false;
+            _mixer?.CompleteSource(state.MixerSource!);
+            bool anyOtherAlive =
+                (_loopbackState?.Alive == true || _loopbackState?.Reconnecting == true)
+                || (_micState?.Alive == true || _micState?.Reconnecting == true);
+            allGone = !anyOtherAlive;
+        }
+
+        if (allGone)
+        {
+            RecordingStatusChanged?.Invoke("All audio streams lost — stopping recording.");
+            lock (_sync)
+            {
+                if (_running)
+                    CompleteSession();
+            }
+        }
+        else
+        {
+            RecordingStatusChanged?.Invoke(
+                $"{label} unavailable — recording continues with the remaining source."
+            );
+        }
+    }
+
+    private void SetCapture(SourceKind kind, WasapiCapture? capture)
+    {
+        if (kind == SourceKind.Loopback)
+            _loopback = capture;
+        else
+            _mic = capture;
+    }
+
+    private WasapiCapture? GetCapture(SourceKind kind) =>
+        kind == SourceKind.Loopback ? _loopback : _mic;
+
+    private static MMDevice? FindDeviceById(string id)
+    {
+        using var enumerator = new MMDeviceEnumerator();
+        foreach (
+            var device in enumerator.EnumerateAudioEndPoints(DataFlow.Render, DeviceState.Active)
+        )
+        {
+            if (device.ID == id)
+                return device;
+        }
+        foreach (
+            var device in enumerator.EnumerateAudioEndPoints(DataFlow.Capture, DeviceState.Active)
+        )
+        {
+            if (device.ID == id)
+                return device;
+        }
+        return null;
+    }
+
+    private static bool FormatsCompatible(WaveFormat a, WaveFormat b) =>
+        a.SampleRate == b.SampleRate
+        && a.Channels == b.Channels
+        && a.Encoding == b.Encoding
+        && a.BitsPerSample == b.BitsPerSample;
+
+    // ---------------- mix thread ----------------
 
     private void MixLoop(float[] chunk)
     {
