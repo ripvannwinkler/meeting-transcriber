@@ -31,24 +31,25 @@ public sealed class PipelineClient : IConversationPipeline
         return await RunBackendAsync(args, progress, ct);
     }
 
-    public Task<string> SummarizeAsync(
+    public async Task<string> SummarizeAsync(
         string transcript,
         IProgress<string>? progress = null,
         CancellationToken ct = default
     )
     {
-        // Wired to the backend in Phase 4 (cli.py summarize + transcribe.py/summarize.py).
-        return Task.FromResult("(Summarization is wired up in Phase 4.)");
+        var args = $"\"{CliScript}\" summarize --config \"{Paths.SettingsFile}\"";
+        return await RunBackendAsync(args, progress, ct, stdinText: transcript);
     }
 
     /// <summary>
-    /// Runs the backend, parses its NDJSON, and returns the "transcript" payload.
-    /// Reports "progress" events and raises on an "error" event or non-zero exit.
+    /// Runs the backend, parses its NDJSON, and returns the "transcript"/"summary"
+    /// payload. Reports "progress" events and raises on an "error" event or non-zero exit.
     /// </summary>
     private static async Task<string> RunBackendAsync(
         string arguments,
         IProgress<string>? progress,
-        CancellationToken ct
+        CancellationToken ct,
+        string? stdinText = null
     )
     {
         if (!File.Exists(PythonExe))
@@ -63,6 +64,7 @@ public sealed class PipelineClient : IConversationPipeline
             WorkingDirectory = Path.Combine(Paths.RepoRoot, "backend"),
             RedirectStandardOutput = true,
             RedirectStandardError = true,
+            RedirectStandardInput = stdinText != null,
             UseShellExecute = false,
             CreateNoWindow = true,
         };
@@ -71,11 +73,19 @@ public sealed class PipelineClient : IConversationPipeline
             Process.Start(psi)
             ?? throw new InvalidOperationException("Failed to start backend process.");
 
-        // Drain stderr on a background task so the pipe never blocks the backend
-        // (tqdm bars and torch noise land here and are ignored).
+        // Feed stdin text (if any) and drain stderr on background tasks so the pipes
+        // never block the backend while it runs (tqdm bars and torch noise land on
+        // stderr and are ignored).
         var stderrTask = process.StandardError.ReadToEndAsync();
+        Task? stdinTask = null;
+        if (stdinText != null)
+        {
+            stdinTask = process
+                .StandardInput.WriteAsync(stdinText)
+                .ContinueWith(_ => process.StandardInput.Close(), CancellationToken.None);
+        }
 
-        string? transcript = null;
+        string? result = null;
         string? backendError = null;
 
         while (true)
@@ -83,14 +93,16 @@ public sealed class PipelineClient : IConversationPipeline
             var line = await process.StandardOutput.ReadLineAsync(ct);
             if (line is null)
                 break;
-            HandleLine(line, progress, ref transcript, ref backendError);
+            HandleLine(line, progress, ref result, ref backendError);
         }
 
         await process.WaitForExitAsync(ct);
+        if (stdinTask != null)
+            await stdinTask;
         var stderr = await stderrTask;
 
-        if (transcript is not null)
-            return transcript;
+        if (result is not null)
+            return result;
 
         if (backendError is not null)
             throw new InvalidOperationException(backendError);
@@ -100,13 +112,13 @@ public sealed class PipelineClient : IConversationPipeline
                 $"Backend failed (exit {process.ExitCode}): {Tail(stderr)}"
             );
 
-        throw new InvalidOperationException("Backend ended without producing a transcript.");
+        throw new InvalidOperationException("Backend ended without producing a result.");
     }
 
     private static void HandleLine(
         string line,
         IProgress<string>? progress,
-        ref string? transcript,
+        ref string? result,
         ref string? backendError
     )
     {
@@ -136,8 +148,9 @@ public sealed class PipelineClient : IConversationPipeline
                         progress.Report(pm.GetString() ?? "");
                     break;
                 case "transcript":
+                case "summary":
                     if (doc.RootElement.TryGetProperty("text", out var tt))
-                        transcript = tt.GetString() ?? "";
+                        result = tt.GetString() ?? "";
                     break;
                 case "error":
                     if (doc.RootElement.TryGetProperty("message", out var em))

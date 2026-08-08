@@ -31,6 +31,9 @@ def main() -> int:
     t.add_argument("--config", default=None, help="Path to settings.json (defaults to repo root)")
     t.add_argument("--json", default=None, help="Optional path to also write plain JSON transcript")
 
+    s = sub.add_parser("summarize", help="Summarize a transcript read from stdin")
+    s.add_argument("--config", default=None, help="Path to settings.json (defaults to repo root)")
+
     args = parser.parse_args()
 
     if args.command == "transcribe":
@@ -46,6 +49,19 @@ def main() -> int:
             emit({"type": "error", "message": str(e)})
             return 1
         except Exception as e:  # noqa: BLE001 - surface any backend error to the app
+            from transcribe import emit
+
+            emit({"type": "error", "message": f"{type(e).__name__}: {e}"})
+            return 1
+    elif args.command == "summarize":
+        from config import load_settings
+        from summarize import run_summarize
+
+        try:
+            settings = load_settings(args.config)
+            transcript = sys.stdin.read()
+            run_summarize(settings, transcript)
+        except Exception as e:  # noqa: BLE001
             from transcribe import emit
 
             emit({"type": "error", "message": f"{type(e).__name__}: {e}"})
