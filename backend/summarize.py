@@ -57,7 +57,15 @@ def run_summarize(settings, transcript: str) -> None:
         )
         response.raise_for_status()
     except requests.RequestException as e:
-        emit({"type": "error", "message": f"API request failed: {e}"})
+        emit(
+            {
+                "type": "error",
+                "message": (
+                    f"API request to {base_url} failed — check that the server is running "
+                    f"and Settings was saved. ({e})"
+                ),
+            }
+        )
         return
 
     try:

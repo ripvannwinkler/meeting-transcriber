@@ -58,6 +58,32 @@ class Settings:
     output_dir: Path = Path("output")
 
 
+def _normalize_keys(obj):
+    """Recursively rewrite key names to snake_case so camelCase keys written by older
+    app versions / manual edits (e.g. "baseUrl", "maxTokens") are still honored."""
+    if isinstance(obj, dict):
+        for key in list(obj.keys()):
+            value = obj.pop(key)
+            obj[_to_snake_case(key)] = value
+            _normalize_keys(value)
+    elif isinstance(obj, list):
+        for item in obj:
+            _normalize_keys(item)
+    return obj
+
+
+def _to_snake_case(name: str) -> str:
+    out: list[str] = []
+    for i, ch in enumerate(name):
+        if ch.isupper():
+            if i > 0:
+                out.append("_")
+            out.append(ch.lower())
+        else:
+            out.append(ch)
+    return "".join(out)
+
+
 def _deep_merge(dst: dict, src: dict) -> None:
     for key, value in src.items():
         if isinstance(value, dict) and isinstance(dst.get(key), dict):
@@ -101,7 +127,7 @@ def load_settings(path: str | Path | None = None) -> Settings:
         )
 
     with open(path, "r", encoding="utf-8") as fh:
-        user_cfg = json.load(fh)
+        user_cfg = _normalize_keys(json.load(fh))
 
     _deep_merge(cfg, user_cfg)
 
