@@ -3,8 +3,11 @@ using NAudio.CoreAudioApi;
 namespace MeetingTranscriber.App.Services;
 
 /// <summary>Bindable wrapper around an MMDevice for UI combo boxes.</summary>
-public sealed record DeviceOption(MMDevice Device, string Name)
+public sealed record DeviceOption(MMDevice? Device, string Name)
 {
+    /// <summary>Sentinel for "don't capture this source" (Device is null).</summary>
+    public static DeviceOption None { get; } = new(null, "None");
+
     public override string ToString() => Name;
 }
 

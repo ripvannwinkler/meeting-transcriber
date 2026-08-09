@@ -40,7 +40,7 @@ public sealed class MainViewModel : ObservableObject, IDisposable
         // Commands first: setters like SelectedPlayback raise CanExecuteChanged.
         StartRecordingCommand = new RelayCommand(
             _ => StartRecording(),
-            _ => !IsRecording && SelectedPlayback is not null
+            _ => !IsRecording && (SelectedPlayback is not null || SelectedInput is not null)
         );
         StopRecordingCommand = new RelayCommand(_ => StopRecording(), _ => IsRecording);
         OpenSettingsCommand = new RelayCommand(_ => OpenSettings(), _ => !IsRecording);
@@ -61,8 +61,11 @@ public sealed class MainViewModel : ObservableObject, IDisposable
         SaveSummaryCommand = new RelayCommand(_ => SaveSummary());
         CopySummaryCommand = new RelayCommand(_ => CopySummary());
 
+        // "None" lets the user record from just one source at a time.
+        PlaybackDevices.Add(DeviceOption.None);
         foreach (var d in DeviceProvider.GetPlaybackDevices())
             PlaybackDevices.Add(new DeviceOption(d, DeviceProvider.DisplayName(d)));
+        InputDevices.Add(DeviceOption.None);
         foreach (var d in DeviceProvider.GetInputDevices())
             InputDevices.Add(new DeviceOption(d, DeviceProvider.DisplayName(d)));
 
@@ -113,7 +116,11 @@ public sealed class MainViewModel : ObservableObject, IDisposable
     public DeviceOption? SelectedInput
     {
         get => _selectedInput;
-        set => Set(ref _selectedInput, value);
+        set
+        {
+            if (Set(ref _selectedInput, value))
+                StartRecordingCommand.RaiseCanExecuteChanged();
+        }
     }
     public float MicGain
     {
@@ -205,20 +212,25 @@ public sealed class MainViewModel : ObservableObject, IDisposable
             return;
 
         var session = _interruptedSession;
-        var loopback = FindDeviceById(PlaybackDevices, session.LoopbackId) ?? SelectedPlayback;
-        if (loopback is null)
+        // A source the session recorded with is 'None' iff its id was not persisted;
+        // an id that no longer resolves falls back to whatever is selected now.
+        var loopback = session.LoopbackId is null
+            ? null
+            : FindDeviceById(PlaybackDevices, session.LoopbackId) ?? SelectedPlayback;
+        var mic = session.MicId is null
+            ? null
+            : FindDeviceById(InputDevices, session.MicId) ?? SelectedInput;
+
+        if (loopback is null && mic is null)
         {
             Status =
-                "Cannot resume: the original speaker output device is unavailable. Pick one and start a new recording.";
+                "Cannot resume: neither original audio source is available. Pick devices and start a new recording.";
             return;
         }
 
-        var mic =
-            session.MicId != null ? FindDeviceById(InputDevices, session.MicId) : SelectedInput;
-
         IsRecording = false; // clear interrupted flag before starting the resumed session
         StartRecordingCore(
-            loopback.Device,
+            loopback?.Device,
             mic?.Device,
             MicGain,
             Paths.RecordingsDir,
@@ -241,10 +253,10 @@ public sealed class MainViewModel : ObservableObject, IDisposable
         _interruptedSession = null;
         ResumeRecordingCommand.RaiseCanExecuteChanged();
 
-        // Don't start if no loopback endpoint is available.
-        if (loopbackDevice is null)
+        // Don't start when neither source is selected (or available).
+        if (loopbackDevice is null && micDevice is null)
         {
-            Status = "No speaker output device available to record.";
+            Status = "Pick at least one audio source (speaker output or microphone) to record.";
             return;
         }
 
@@ -278,7 +290,7 @@ public sealed class MainViewModel : ObservableObject, IDisposable
     {
         if (string.IsNullOrEmpty(id))
             return null;
-        return options.FirstOrDefault(o => o.Device.ID == id);
+        return options.FirstOrDefault(o => o.Device?.ID == id);
     }
 
     private void StopRecording()
@@ -299,13 +311,23 @@ public sealed class MainViewModel : ObservableObject, IDisposable
         ResumeRecordingCommand.RaiseCanExecuteChanged();
         TranscribeCommand.RaiseCanExecuteChanged();
 
+        var parts = new List<string>();
+        if (r.LoopbackTrack is not null)
+            parts.Add($"speaker signal {r.LoopbackSignalPct}%");
+        if (r.MicTrack is not null)
+            parts.Add($"mic signal {r.MicSignalPct}%");
+        var detail = parts.Count > 0 ? "  [" + string.Join(" | ", parts) + "]" : "";
+        // Low-signal warnings only apply to sources the user actually recorded from.
+        var lowSignal =
+            (r.LoopbackTrack is not null && r.LoopbackSignalPct < 25)
+            || (r.MicTrack is not null && r.MicSignalPct < 25);
         var baseline = r.Interrupted
             ? $"Saved: {r.Path} ({r.DurationSeconds:F1}s) — an audio stream dropped during recording, so there is a gap in the audio."
             : $"Saved: {r.Path} ({r.DurationSeconds:F1}s)";
         Status =
-            $"{baseline}  [speaker signal {r.LoopbackSignalPct}% | mic signal {r.MicSignalPct}%]"
+            $"{baseline}{detail}"
             + (
-                r.LoopbackSignalPct < 25 || r.MicSignalPct < 25
+                lowSignal
                     ? $"  Low signal! Details: {System.IO.Path.Combine(Paths.RecordingsDir, "recording_debug.log")}"
                     : ""
             );
@@ -426,7 +448,7 @@ public sealed class MainViewModel : ObservableObject, IDisposable
         if (match != null)
         {
             foreach (var option in options)
-                if (option.Device.ID == match.ID)
+                if (option.Device?.ID == match.ID)
                     return option;
         }
         return options.FirstOrDefault();

@@ -93,7 +93,7 @@ public sealed class RecordingService : IDisposable
     public event Action<string>? RecordingStatusChanged;
 
     public void StartRecording(
-        MMDevice loopbackDevice,
+        MMDevice? loopbackDevice,
         MMDevice? micDevice,
         float micGain,
         string outputDir,
@@ -104,6 +104,11 @@ public sealed class RecordingService : IDisposable
         {
             if (_running)
                 return;
+
+            if (loopbackDevice is null && micDevice is null)
+                throw new ArgumentException(
+                    "At least one audio source (speaker output or microphone) must be selected."
+                );
 
             Directory.CreateDirectory(outputDir);
             _outputPath =
@@ -118,13 +123,16 @@ public sealed class RecordingService : IDisposable
             _stopping = false;
             _stopRequested = false;
 
-            _loopbackState = new SourceState
+            if (loopbackDevice is not null)
             {
-                Kind = SourceKind.Loopback,
-                DeviceId = loopbackDevice.ID,
-                Gain = 0.85f,
-                Configured = true,
-            };
+                _loopbackState = new SourceState
+                {
+                    Kind = SourceKind.Loopback,
+                    DeviceId = loopbackDevice.ID,
+                    Gain = 0.85f,
+                    Configured = true,
+                };
+            }
 
             if (micDevice != null)
             {
@@ -139,8 +147,9 @@ public sealed class RecordingService : IDisposable
 
             try
             {
-                LaunchCapture(_loopbackState, loopbackDevice);
-                if (_micState != null)
+                if (_loopbackState is not null)
+                    LaunchCapture(_loopbackState, loopbackDevice!);
+                if (_micState is not null)
                     LaunchCapture(_micState, micDevice!);
 
                 _sink = new WavSink(_outputPath, OutputFormat, append: continueFromPath != null);
@@ -148,13 +157,16 @@ public sealed class RecordingService : IDisposable
 
                 // Sidecar per-source mono tracks for dual-stream transcription.
                 var baseName = System.IO.Path.ChangeExtension(_outputPath, null);
-                _loopbackTrackPath = baseName + "_loopback.wav";
-                _loopbackTrackSink = new WavSink(
-                    _loopbackTrackPath,
-                    TrackFormat,
-                    append: continueFromPath != null
-                );
-                if (_micState != null)
+                if (_loopbackState is not null)
+                {
+                    _loopbackTrackPath = baseName + "_loopback.wav";
+                    _loopbackTrackSink = new WavSink(
+                        _loopbackTrackPath,
+                        TrackFormat,
+                        append: continueFromPath != null
+                    );
+                }
+                if (_micState is not null)
                 {
                     _micTrackPath = baseName + "_mic.wav";
                     _micTrackSink = new WavSink(
@@ -164,10 +176,14 @@ public sealed class RecordingService : IDisposable
                     );
                 }
 
-                WriteSessionMarker(loopbackDevice.ID, micDevice?.ID);
+                WriteSessionMarker(loopbackDevice?.ID, micDevice?.ID);
                 Log(
                     $"session start | wav={_outputPath} append={continueFromPath != null} | "
-                        + $"loopback={loopbackDevice.FriendlyName} [{loopbackDevice.ID}] fmt={(_loopbackState?.Format?.SampleRate ?? 0)}/{_loopbackState?.Format?.Channels ?? 0} get->{_loopbackState?.Format?.Encoding}"
+                        + (
+                            loopbackDevice != null
+                                ? $"loopback={loopbackDevice.FriendlyName} [{loopbackDevice.ID}] fmt={(_loopbackState?.Format?.SampleRate ?? 0)}/{_loopbackState?.Format?.Channels ?? 0} get->{_loopbackState?.Format?.Encoding}"
+                                : "loopback=none"
+                        )
                         + (
                             micDevice != null
                                 ? $" | mic={micDevice.FriendlyName} [{micDevice.ID}] fmt={(_micState?.Format?.SampleRate ?? 0)}/{_micState?.Format?.Channels ?? 0}"
@@ -182,7 +198,8 @@ public sealed class RecordingService : IDisposable
                     Name = "MeetingMixer",
                 };
 
-                _loopbackState!.Alive = true;
+                if (_loopbackState is { } loopState)
+                    loopState.Alive = true;
                 if (_micState is { } micState)
                     micState.Alive = true;
 
@@ -305,7 +322,9 @@ public sealed class RecordingService : IDisposable
                 + $"loopback sig%={loopbackPct} (arr={loopArr}) "
                 + $"mic sig%={micPct} (arr={micArr})"
         );
-        Log($"tracks: loop={_loopbackTrackPath} mic={_micTrackPath ?? "none"}");
+        Log(
+            $"tracks: loop={(_loopbackTrackPath.Length > 0 ? _loopbackTrackPath : "none")} mic={_micTrackPath ?? "none"}"
+        );
         RecordingStopped?.Invoke(result);
         return result;
     }
@@ -656,8 +675,12 @@ public sealed class RecordingService : IDisposable
 
                     var loopPeak = _loopbackState?.MixerSource?.LastPeak ?? 0f;
                     var micPeak = _micState?.MixerSource?.LastPeak ?? 0f;
+                    var loopTxt = _loopbackState is not null
+                        ? $"speaker {loopPeak:F2}"
+                        : "speaker off";
+                    var micTxt = _micState is not null ? $"mic {micPeak:F2}" : "mic off";
                     RecordingStatusChanged?.Invoke(
-                        $"Recording… (t={sec}s)  speaker {loopPeak:F2}  |  mic {micPeak:F2}"
+                        $"Recording… (t={sec}s)  {loopTxt}  |  {micTxt}"
                     );
                 }
             }
@@ -904,7 +927,7 @@ public sealed class RecordingService : IDisposable
         }
     }
 
-    private void WriteSessionMarker(string loopbackId, string? micId)
+    private void WriteSessionMarker(string? loopbackId, string? micId)
     {
         try
         {
